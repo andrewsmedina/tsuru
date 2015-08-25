@@ -33,12 +33,13 @@ func (t *machineCreate) Run(job monsterqueue.Job) {
 	jobId := params["jobId"].(string)
 	vmId := params["vmId"].(string)
 	projectId := params["projectId"].(string)
+	jobParams := monsterqueue.JobParams{"vmId": vmId}
+	if projectId != "" {
+		jobParams["projectId"] = projectId
+	}
 	ip, err := t.iaas.waitVMIsCreated(jobId, vmId, projectId)
 	if err != nil {
-		_, qErr := job.Queue().Enqueue(t.iaas.taskName(machineDeleteTaskName), monsterqueue.JobParams{
-			"vmId":      vmId,
-			"projectId": projectId,
-		})
+		_, qErr := job.Queue().Enqueue(t.iaas.taskName(machineDeleteTaskName), jobParams)
 		if qErr != nil {
 			job.Error(fmt.Errorf("error trying to enqueue deletion: %s caused by: %s", qErr, err))
 			return
@@ -48,10 +49,7 @@ func (t *machineCreate) Run(job monsterqueue.Job) {
 	}
 	notified, _ := job.Success(ip)
 	if !notified {
-		_, err = job.Queue().Enqueue(t.iaas.taskName(machineDeleteTaskName), monsterqueue.JobParams{
-			"vmId":      vmId,
-			"projectId": projectId,
-		})
+		_, err = job.Queue().Enqueue(t.iaas.taskName(machineDeleteTaskName), jobParams)
 		if err != nil {
 			log.Errorf("could not enqueue delete unnotified vm: %s", err)
 			return
@@ -66,12 +64,12 @@ func (t *machineDelete) Name() string {
 func (t *machineDelete) Run(job monsterqueue.Job) {
 	params := job.Parameters()
 	vmId := params["vmId"].(string)
-	projectId := params["projectId"].(string)
 	var volumesRsp ListVolumesResponse
-	err := t.iaas.do("listVolumes", ApiParams{
-		"virtualmachineid": vmId,
-		"projectid":        projectId,
-	}, &volumesRsp)
+	apiParams := ApiParams{"virtualmachineid": vmId}
+	if projectId, ok := params["projectId"]; ok {
+		apiParams["projectid"] = projectId.(string)
+	}
+	err := t.iaas.do("listVolumes", apiParams, &volumesRsp)
 	if err != nil {
 		job.Error(err)
 		return
