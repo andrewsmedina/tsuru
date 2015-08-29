@@ -8,50 +8,73 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/tsuru/tsuru/auth"
+	"github.com/tsuru/tsuru/api/context"
 	"github.com/tsuru/tsuru/errors"
 	"github.com/tsuru/tsuru/provision"
+	"golang.org/x/net/websocket"
 )
 
-func remoteShellHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	unitID := r.URL.Query().Get("unit")
-	// TODO(fss): drop this in tsr >= 0.12.0
-	if unitID == "" {
-		unitID = r.URL.Query().Get("container_id")
-	}
-	width, _ := strconv.Atoi(r.URL.Query().Get("width"))
-	height, _ := strconv.Atoi(r.URL.Query().Get("height"))
-	term := r.URL.Query().Get("term")
-	u, err := t.User()
-	if err != nil {
-		return err
-	}
-	appName := r.URL.Query().Get(":app")
-	app, err := getApp(appName, u)
-	if err != nil {
-		return err
-	}
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		return &errors.HTTP{
-			Code:    http.StatusInternalServerError,
-			Message: "cannot hijack connection",
+func remoteShellHandler(ws *websocket.Conn) {
+	var httpErr *errors.HTTP
+	defer func() {
+		defer ws.Close()
+		if httpErr != nil {
+			var msg string
+			switch httpErr.Code {
+			case http.StatusUnauthorized:
+				msg = "no token provided or session expired, please login again\n"
+			default:
+				msg = httpErr.Message + "\n"
+			}
+			ws.Write([]byte("Error: " + msg))
 		}
+	}()
+	r := ws.Request()
+	token := context.GetAuthToken(r)
+	if token == nil {
+		httpErr = &errors.HTTP{
+			Code:    http.StatusUnauthorized,
+			Message: "no token provided",
+		}
+		return
 	}
-	conn, _, err := hj.Hijack()
+	user, err := token.User()
 	if err != nil {
-		return &errors.HTTP{
+		httpErr = &errors.HTTP{
 			Code:    http.StatusInternalServerError,
 			Message: err.Error(),
 		}
+		return
 	}
-	defer conn.Close()
+	appName := r.URL.Query().Get(":appname")
+	app, err := getApp(appName, user, r)
+	if err != nil {
+		if herr, ok := err.(*errors.HTTP); ok {
+			httpErr = herr
+		} else {
+			httpErr = &errors.HTTP{
+				Code:    http.StatusInternalServerError,
+				Message: err.Error(),
+			}
+		}
+		return
+	}
+	unitID := r.URL.Query().Get("unit")
+	width, _ := strconv.Atoi(r.URL.Query().Get("width"))
+	height, _ := strconv.Atoi(r.URL.Query().Get("height"))
+	term := r.URL.Query().Get("term")
 	opts := provision.ShellOptions{
-		Conn:   conn,
+		Conn:   ws,
 		Width:  width,
 		Height: height,
 		Unit:   unitID,
 		Term:   term,
 	}
-	return app.Shell(opts)
+	err = app.Shell(opts)
+	if err != nil {
+		httpErr = &errors.HTTP{
+			Code:    http.StatusInternalServerError,
+			Message: err.Error(),
+		}
+	}
 }

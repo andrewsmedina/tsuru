@@ -10,6 +10,7 @@ package queue
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/tsuru/config"
 	"github.com/tsuru/monsterqueue"
@@ -48,7 +49,7 @@ func Factory() (PubSubFactory, error) {
 }
 
 type queueInstanceData struct {
-	sync.Mutex
+	sync.RWMutex
 	instance monsterqueue.Queue
 }
 
@@ -78,6 +79,12 @@ func ResetQueue() {
 }
 
 func Queue() (monsterqueue.Queue, error) {
+	queueData.RLock()
+	if queueData.instance != nil {
+		defer queueData.RUnlock()
+		return queueData.instance, nil
+	}
+	queueData.RUnlock()
 	queueData.Lock()
 	defer queueData.Unlock()
 	if queueData.instance != nil {
@@ -88,10 +95,15 @@ func Queue() (monsterqueue.Queue, error) {
 		queueMongoUrl = "localhost:27017"
 	}
 	queueMongoDB, _ := config.GetString("queue:mongo-database")
+	pollingInterval, _ := config.GetFloat("queue:mongo-polling-interval")
+	if pollingInterval == 0.0 {
+		pollingInterval = 1.0
+	}
 	conf := mongodb.QueueConfig{
 		CollectionPrefix: "tsuru",
 		Url:              queueMongoUrl,
 		Database:         queueMongoDB,
+		PollingInterval:  time.Duration(pollingInterval * float64(time.Second)),
 	}
 	var err error
 	queueData.instance, err = mongodb.NewQueue(conf)

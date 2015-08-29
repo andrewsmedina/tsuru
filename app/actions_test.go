@@ -164,8 +164,6 @@ func (s *S) TestExportEnvironmentsForward(c *check.C) {
 	appEnv := gotApp.InstanceEnv("")
 	c.Assert(appEnv["TSURU_APPNAME"].Value, check.Equals, app.Name)
 	c.Assert(appEnv["TSURU_APPNAME"].Public, check.Equals, false)
-	c.Assert(appEnv["TSURU_HOST"].Value, check.Equals, expectedHost)
-	c.Assert(appEnv["TSURU_HOST"].Public, check.Equals, false)
 	c.Assert(appEnv["TSURU_APP_TOKEN"].Value, check.Not(check.Equals), "")
 	c.Assert(appEnv["TSURU_APP_TOKEN"].Public, check.Equals, false)
 	c.Assert(appEnv["TSURU_APPDir"].Value, check.Not(check.Equals), "/home/application/current")
@@ -187,7 +185,7 @@ func (s *S) TestExportEnvironmentsBackward(c *check.C) {
 	}
 	token, err := nativeScheme.AppLogin(app.Name)
 	c.Assert(err, check.IsNil)
-	app.Env["TSURU_APP_TOKEN"] = bind.EnvVar{Name: "TSURU_APP_NAME", Value: token.GetValue()}
+	app.Env["TSURU_APP_TOKEN"] = bind.EnvVar{Name: "TSURU_APP_TOKEN", Value: token.GetValue()}
 	err = s.conn.Apps().Insert(app)
 	c.Assert(err, check.IsNil)
 	defer s.conn.Apps().Remove(bson.M{"name": app.Name})
@@ -551,7 +549,7 @@ func (s *S) TestProvisionAddUnits(c *check.C) {
 	}
 	s.provisioner.Provision(&app)
 	defer s.provisioner.Destroy(&app)
-	ctx := action.FWContext{Previous: 3, Params: []interface{}{&app}}
+	ctx := action.FWContext{Previous: 3, Params: []interface{}{&app, 3, nil, "web"}}
 	fwresult, err := provisionAddUnits.Forward(ctx)
 	c.Assert(err, check.IsNil)
 	units, ok := fwresult.([]provision.Unit)
@@ -566,7 +564,7 @@ func (s *S) TestProvisionAddUnitsProvisionFailure(c *check.C) {
 		Name:     "visions",
 		Platform: "django",
 	}
-	ctx := action.FWContext{Previous: 3, Params: []interface{}{&app}}
+	ctx := action.FWContext{Previous: 3, Params: []interface{}{&app, 3, nil, "web"}}
 	result, err := provisionAddUnits.Forward(ctx)
 	c.Assert(result, check.IsNil)
 	c.Assert(err, check.NotNil)
@@ -578,20 +576,6 @@ func (s *S) TestProvisionAddUnitsInvalidApp(c *check.C) {
 	c.Assert(result, check.IsNil)
 	c.Assert(err, check.NotNil)
 	c.Assert(err.Error(), check.Equals, "First parameter must be *App.")
-}
-
-func (s *S) TestProvisionAddUnitsBackward(c *check.C) {
-	app := App{
-		Name:     "fiction",
-		Platform: "django",
-	}
-	s.provisioner.Provision(&app)
-	defer s.provisioner.Destroy(&app)
-	units, err := s.provisioner.AddUnits(&app, 3, nil)
-	c.Assert(err, check.IsNil)
-	ctx := action.BWContext{Params: []interface{}{&app}, FWResult: units}
-	provisionAddUnits.Backward(ctx)
-	c.Assert(s.provisioner.GetUnits(&app), check.HasLen, 0)
 }
 
 func (s *S) TestProvisionAddUnitsMinParams(c *check.C) {
@@ -610,13 +594,13 @@ func (s *S) TestSetAppIpForward(c *check.C) {
 	}
 	r, err := setAppIp.Forward(ctx)
 	c.Assert(err, check.IsNil)
-	c.Assert(app.Ip, check.Equals, "conviction.fake-lb.tsuru.io")
+	c.Assert(app.Ip, check.Equals, "conviction.fakerouter.com")
 	a, ok := r.(*App)
 	c.Assert(ok, check.Equals, true)
-	c.Assert(a.Ip, check.Equals, "conviction.fake-lb.tsuru.io")
+	c.Assert(a.Ip, check.Equals, "conviction.fakerouter.com")
 	gotApp, err := GetByName(app.Name)
 	c.Assert(err, check.IsNil)
-	c.Assert(gotApp.Ip, check.Equals, "conviction.fake-lb.tsuru.io")
+	c.Assert(gotApp.Ip, check.Equals, "conviction.fakerouter.com")
 }
 
 func (s *S) TestSetAppIpBackward(c *check.C) {

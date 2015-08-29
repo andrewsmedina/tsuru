@@ -7,9 +7,13 @@ package service
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
+	"sort"
 	"strconv"
+	"sync"
 	"sync/atomic"
 
 	"github.com/tsuru/config"
@@ -41,6 +45,10 @@ func (s *InstanceSuite) SetUpSuite(c *check.C) {
 	config.Set("admin-team", "admin")
 	s.conn, err = db.Conn()
 	c.Assert(err, check.IsNil)
+}
+
+func (s *InstanceSuite) SetUpTest(c *check.C) {
+	dbtest.ClearAllCollections(s.conn.Apps().Database)
 	s.user = &auth.User{Email: "cidade@raul.com", Password: "123"}
 	s.team = &auth.Team{Name: "Raul", Users: []string{s.user.Email}}
 	s.conn.Users().Insert(s.user)
@@ -48,7 +56,6 @@ func (s *InstanceSuite) SetUpSuite(c *check.C) {
 }
 
 func (s *InstanceSuite) TearDownSuite(c *check.C) {
-	dbtest.ClearAllCollections(s.conn.Apps().Database)
 	s.conn.Close()
 }
 
@@ -74,26 +81,6 @@ func (s *InstanceSuite) TestRetrieveAssociatedService(c *check.C) {
 	c.Assert(service.Name, check.Equals, rService.Name)
 }
 
-func (s *InstanceSuite) TestAddApp(c *check.C) {
-	instance := ServiceInstance{
-		Name: "myinstance",
-		Apps: []string{},
-	}
-	err := instance.AddApp("app1")
-	c.Assert(err, check.IsNil)
-	c.Assert(instance.Apps, check.DeepEquals, []string{"app1"})
-}
-
-func (s *InstanceSuite) TestAddAppReturnErrorIfTheAppIsAlreadyPresent(c *check.C) {
-	instance := ServiceInstance{
-		Name: "myinstance",
-		Apps: []string{"app1"},
-	}
-	err := instance.AddApp("app1")
-	c.Assert(err, check.NotNil)
-	c.Assert(err, check.ErrorMatches, "^This instance already has this app.$")
-}
-
 func (s *InstanceSuite) TestFindApp(c *check.C) {
 	instance := ServiceInstance{
 		Name: "myinstance",
@@ -104,77 +91,41 @@ func (s *InstanceSuite) TestFindApp(c *check.C) {
 	c.Assert(instance.FindApp("what"), check.Equals, -1)
 }
 
-func (s *InstanceSuite) TestRemoveApp(c *check.C) {
-	instance := ServiceInstance{
-		Name: "myinstance",
-		Apps: []string{"app1", "app2", "app3"},
-	}
-	err := instance.RemoveApp("app2")
-	c.Assert(err, check.IsNil)
-	c.Assert(instance.Apps, check.DeepEquals, []string{"app1", "app3"})
-	err = instance.RemoveApp("app3")
-	c.Assert(err, check.IsNil)
-	c.Assert(instance.Apps, check.DeepEquals, []string{"app1"})
-}
-
-func (s *InstanceSuite) TestRemoveAppReturnsErrorWhenTheAppIsNotBoundToTheInstance(c *check.C) {
-	instance := ServiceInstance{
-		Name: "myinstance",
-		Apps: []string{"app1", "app2", "app3"},
-	}
-	err := instance.RemoveApp("app4")
-	c.Assert(err, check.NotNil)
-	c.Assert(err, check.ErrorMatches, "^This app is not bound to this service instance.$")
-}
-
-func (s *InstanceSuite) TestReload(c *check.C) {
-	instance := ServiceInstance{Name: "myinstance", Apps: []string{"app1", "app2", "app3"}}
-	err := instance.Create()
-	c.Assert(err, check.IsNil)
-	defer s.conn.ServiceInstances().Remove(bson.M{"name": instance.Name})
-	instance.Apps = nil
-	err = s.conn.ServiceInstances().Update(bson.M{"name": instance.Name}, bson.M{"$addToSet": bson.M{"apps": "app4"}})
-	c.Assert(err, check.IsNil)
-	err = instance.reload()
-	c.Assert(err, check.IsNil)
-	c.Assert(instance.Apps, check.DeepEquals, []string{"app1", "app2", "app3", "app4"})
-}
-
 func (s *InstanceSuite) TestBindApp(c *check.C) {
-	oldAddAppToServiceInstance := addAppToServiceInstance
-	oldSetBindAppAction := setBindAppAction
-	oldSetTsuruServices := setTsuruServices
-	oldBindUnitsToServiceInstance := bindUnitsToServiceInstance
+	oldBindAppDBAction := bindAppDBAction
+	oldBindAppEndpointAction := bindAppEndpointAction
+	oldSetBindedEnvsAction := setBindedEnvsAction
+	oldBindUnitsAction := bindUnitsAction
 	defer func() {
-		addAppToServiceInstance = oldAddAppToServiceInstance
-		setBindAppAction = oldSetBindAppAction
-		setTsuruServices = oldSetTsuruServices
-		bindUnitsToServiceInstance = oldBindUnitsToServiceInstance
+		bindAppDBAction = oldBindAppDBAction
+		bindAppEndpointAction = oldBindAppEndpointAction
+		setBindedEnvsAction = oldSetBindedEnvsAction
+		bindUnitsAction = oldBindUnitsAction
 	}()
 	var calls []string
 	var params []interface{}
-	addAppToServiceInstance = action.Action{
+	bindAppDBAction = action.Action{
 		Forward: func(ctx action.FWContext) (action.Result, error) {
-			calls = append(calls, "addAppToServiceInstance")
+			calls = append(calls, "bindAppDBAction")
 			params = ctx.Params
 			return nil, nil
 		},
 	}
-	setBindAppAction = action.Action{
+	bindAppEndpointAction = action.Action{
 		Forward: func(ctx action.FWContext) (action.Result, error) {
-			calls = append(calls, "setBindAppAction")
+			calls = append(calls, "bindAppEndpointAction")
 			return nil, nil
 		},
 	}
-	setTsuruServices = action.Action{
+	setBindedEnvsAction = action.Action{
 		Forward: func(ctx action.FWContext) (action.Result, error) {
-			calls = append(calls, "setTsuruServices")
+			calls = append(calls, "setBindedEnvsAction")
 			return nil, nil
 		},
 	}
-	bindUnitsToServiceInstance = action.Action{
+	bindUnitsAction = action.Action{
 		Forward: func(ctx action.FWContext) (action.Result, error) {
-			calls = append(calls, "bindUnitsToServiceInstance")
+			calls = append(calls, "bindUnitsAction")
 			return nil, nil
 		},
 	}
@@ -184,42 +135,13 @@ func (s *InstanceSuite) TestBindApp(c *check.C) {
 	err := si.BindApp(a, &buf)
 	c.Assert(err, check.IsNil)
 	expectedCalls := []string{
-		"addAppToServiceInstance", "setBindAppAction",
-		"setTsuruServices", "bindUnitsToServiceInstance",
+		"bindAppDBAction", "bindAppEndpointAction",
+		"setBindedEnvsAction", "bindUnitsAction",
 	}
-	expectedParams := []interface{}{a, si, &buf}
+	expectedParams := []interface{}{&bindPipelineArgs{app: a, serviceInstance: &si, writer: &buf}}
 	c.Assert(calls, check.DeepEquals, expectedCalls)
 	c.Assert(params, check.DeepEquals, expectedParams)
 	c.Assert(buf.String(), check.Equals, "")
-}
-
-func (s *InstanceSuite) TestUnbindApp(c *check.C) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"DATABASE_USER":"root","DATABASE_PASSWORD":"s3cr3t"}`))
-	}))
-	defer ts.Close()
-	service := Service{Name: "mysql", Endpoint: map[string]string{"production": ts.URL}}
-	err := service.Create()
-	c.Assert(err, check.IsNil)
-	defer s.conn.Services().RemoveId(service.Name)
-	a := provisiontest.NewFakeApp("myapp", "static", 1)
-	si := ServiceInstance{
-		Name:        "my-mysql",
-		ServiceName: "mysql",
-		Teams:       []string{s.team.Name},
-		Apps:        []string{a.GetName()},
-	}
-	err = si.Create()
-	c.Assert(err, check.IsNil)
-	defer s.conn.ServiceInstances().RemoveId(si.Name)
-	instance := bind.ServiceInstance{Name: si.Name}
-	err = a.AddInstance(si.ServiceName, instance, nil)
-	c.Assert(err, check.IsNil)
-	var buf bytes.Buffer
-	err = si.UnbindApp(a, &buf)
-	c.Assert(err, check.IsNil)
-	c.Assert(a.GetInstances("mysql"), check.HasLen, 0)
-	c.Assert(buf.String(), check.Equals, "remove instance")
 }
 
 func (s *InstanceSuite) TestGetServiceInstancesByServices(c *check.C) {
@@ -849,4 +771,324 @@ func (s *InstanceSuite) TestRevokeTeamToInstance(c *check.C) {
 	_, err = GetServiceInstance("j4sql", user)
 	c.Assert(err, check.NotNil)
 	c.Assert(ErrAccessNotAllowed, check.Equals, err)
+}
+
+func (s *InstanceSuite) TestUnbindApp(c *check.C) {
+	var reqs []*http.Request
+	var mut sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mut.Lock()
+		defer mut.Unlock()
+		reqs = append(reqs, r)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	serv := Service{Name: "mysql", Endpoint: map[string]string{"production": ts.URL}}
+	err := serv.Create()
+	c.Assert(err, check.IsNil)
+	defer s.conn.Services().RemoveId(serv.Name)
+	a := provisiontest.NewFakeApp("myapp", "static", 2)
+	si := ServiceInstance{
+		Name:        "my-mysql",
+		ServiceName: "mysql",
+		Teams:       []string{s.team.Name},
+		Apps:        []string{a.GetName()},
+	}
+	err = si.Create()
+	c.Assert(err, check.IsNil)
+	defer s.conn.ServiceInstances().RemoveId(si.Name)
+	instance := bind.ServiceInstance{Name: si.Name, Envs: map[string]string{"ENV1": "VAL1", "ENV2": "VAL2"}}
+	err = a.AddInstance(si.ServiceName, instance, nil)
+	c.Assert(err, check.IsNil)
+	units, err := a.Units()
+	c.Assert(err, check.IsNil)
+	for i := range units {
+		err = si.BindUnit(a, &units[i])
+		c.Assert(err, check.IsNil)
+	}
+	var buf bytes.Buffer
+	err = si.UnbindApp(a, &buf)
+	c.Assert(err, check.IsNil)
+	c.Assert(buf.String(), check.Matches, "remove instance")
+	c.Assert(reqs, check.HasLen, 5)
+	c.Assert(reqs[0].Method, check.Equals, "POST")
+	c.Assert(reqs[0].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	c.Assert(reqs[1].Method, check.Equals, "POST")
+	c.Assert(reqs[1].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	c.Assert(reqs[2].Method, check.Equals, "DELETE")
+	c.Assert(reqs[2].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	c.Assert(reqs[3].Method, check.Equals, "DELETE")
+	c.Assert(reqs[3].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	c.Assert(reqs[4].Method, check.Equals, "DELETE")
+	c.Assert(reqs[4].URL.Path, check.Equals, "/resources/my-mysql/bind-app")
+	siDB, err := GetServiceInstance(si.Name, s.user)
+	c.Assert(err, check.IsNil)
+	c.Assert(siDB.Apps, check.DeepEquals, []string{})
+	c.Assert(a.GetInstances("mysql"), check.DeepEquals, []bind.ServiceInstance{})
+}
+
+func (s *InstanceSuite) TestUnbindAppFailureInUnbindAppCall(c *check.C) {
+	var reqs []*http.Request
+	var mut sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mut.Lock()
+		defer mut.Unlock()
+		reqs = append(reqs, r)
+		if r.Method == "DELETE" && r.URL.Path == "/resources/my-mysql/bind-app" {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("my unbind app err"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	serv := Service{Name: "mysql", Endpoint: map[string]string{"production": ts.URL}}
+	err := serv.Create()
+	c.Assert(err, check.IsNil)
+	defer s.conn.Services().RemoveId(serv.Name)
+	a := provisiontest.NewFakeApp("myapp", "static", 2)
+	si := ServiceInstance{
+		Name:        "my-mysql",
+		ServiceName: "mysql",
+		Teams:       []string{s.team.Name},
+		Apps:        []string{a.GetName()},
+	}
+	err = si.Create()
+	c.Assert(err, check.IsNil)
+	defer s.conn.ServiceInstances().RemoveId(si.Name)
+	instance := bind.ServiceInstance{Name: si.Name, Envs: map[string]string{"ENV1": "VAL1", "ENV2": "VAL2"}}
+	err = a.AddInstance(si.ServiceName, instance, nil)
+	c.Assert(err, check.IsNil)
+	units, err := a.Units()
+	c.Assert(err, check.IsNil)
+	for i := range units {
+		err = si.BindUnit(a, &units[i])
+		c.Assert(err, check.IsNil)
+	}
+	var buf bytes.Buffer
+	err = si.UnbindApp(a, &buf)
+	c.Assert(err, check.ErrorMatches, `Failed to unbind \("/resources/my-mysql/bind-app"\): my unbind app err`)
+	c.Assert(buf.String(), check.Matches, "")
+	c.Assert(si.Apps, check.DeepEquals, []string{"myapp"})
+	c.Assert(reqs, check.HasLen, 7)
+	c.Assert(reqs[0].Method, check.Equals, "POST")
+	c.Assert(reqs[0].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	c.Assert(reqs[1].Method, check.Equals, "POST")
+	c.Assert(reqs[1].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	c.Assert(reqs[2].Method, check.Equals, "DELETE")
+	c.Assert(reqs[2].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	c.Assert(reqs[3].Method, check.Equals, "DELETE")
+	c.Assert(reqs[3].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	c.Assert(reqs[4].Method, check.Equals, "DELETE")
+	c.Assert(reqs[4].URL.Path, check.Equals, "/resources/my-mysql/bind-app")
+	c.Assert(reqs[5].Method, check.Equals, "POST")
+	c.Assert(reqs[5].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	c.Assert(reqs[6].Method, check.Equals, "POST")
+	c.Assert(reqs[6].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	siDB, err := GetServiceInstance(si.Name, s.user)
+	c.Assert(err, check.IsNil)
+	c.Assert(siDB.Apps, check.DeepEquals, []string{"myapp"})
+	c.Assert(a.GetInstances("mysql"), check.DeepEquals, []bind.ServiceInstance{instance})
+}
+
+func (s *InstanceSuite) TestUnbindAppFailureInAppEnvSet(c *check.C) {
+	var reqs []*http.Request
+	var mut sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mut.Lock()
+		defer mut.Unlock()
+		reqs = append(reqs, r)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	serv := Service{Name: "mysql", Endpoint: map[string]string{"production": ts.URL}}
+	err := serv.Create()
+	c.Assert(err, check.IsNil)
+	defer s.conn.Services().RemoveId(serv.Name)
+	a := provisiontest.NewFakeApp("myapp", "static", 2)
+	si := ServiceInstance{
+		Name:        "my-mysql",
+		ServiceName: "mysql",
+		Teams:       []string{s.team.Name},
+		Apps:        []string{a.GetName()},
+	}
+	err = si.Create()
+	c.Assert(err, check.IsNil)
+	defer s.conn.ServiceInstances().RemoveId(si.Name)
+	units, err := a.Units()
+	c.Assert(err, check.IsNil)
+	for i := range units {
+		err = si.BindUnit(a, &units[i])
+		c.Assert(err, check.IsNil)
+	}
+	var buf bytes.Buffer
+	err = si.UnbindApp(a, &buf)
+	c.Assert(err, check.ErrorMatches, `instance not found`)
+	c.Assert(buf.String(), check.Matches, "")
+	c.Assert(si.Apps, check.DeepEquals, []string{"myapp"})
+	c.Assert(reqs, check.HasLen, 8)
+	c.Assert(reqs[0].Method, check.Equals, "POST")
+	c.Assert(reqs[0].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	c.Assert(reqs[1].Method, check.Equals, "POST")
+	c.Assert(reqs[1].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	c.Assert(reqs[2].Method, check.Equals, "DELETE")
+	c.Assert(reqs[2].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	c.Assert(reqs[3].Method, check.Equals, "DELETE")
+	c.Assert(reqs[3].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	c.Assert(reqs[4].Method, check.Equals, "DELETE")
+	c.Assert(reqs[4].URL.Path, check.Equals, "/resources/my-mysql/bind-app")
+	c.Assert(reqs[5].Method, check.Equals, "POST")
+	c.Assert(reqs[5].URL.Path, check.Equals, "/resources/my-mysql/bind-app")
+	c.Assert(reqs[6].Method, check.Equals, "POST")
+	c.Assert(reqs[6].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	c.Assert(reqs[7].Method, check.Equals, "POST")
+	c.Assert(reqs[7].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	siDB, err := GetServiceInstance(si.Name, s.user)
+	c.Assert(err, check.IsNil)
+	c.Assert(siDB.Apps, check.DeepEquals, []string{"myapp"})
+}
+
+func (s *InstanceSuite) TestBindAppFullPipeline(c *check.C) {
+	var reqs []*http.Request
+	var mut sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mut.Lock()
+		defer mut.Unlock()
+		reqs = append(reqs, r)
+		w.WriteHeader(http.StatusOK)
+		if r.URL.Path == "/resources/my-mysql/bind-app" && r.Method == "POST" {
+			w.Write([]byte(`{"ENV1": "VAL1", "ENV2": "VAL2"}`))
+		}
+	}))
+	defer ts.Close()
+	serv := Service{Name: "mysql", Endpoint: map[string]string{"production": ts.URL}}
+	err := serv.Create()
+	c.Assert(err, check.IsNil)
+	si := ServiceInstance{
+		Name:        "my-mysql",
+		ServiceName: "mysql",
+		Teams:       []string{s.team.Name},
+	}
+	err = si.Create()
+	c.Assert(err, check.IsNil)
+	a := provisiontest.NewFakeApp("myapp", "static", 2)
+	var buf bytes.Buffer
+	err = si.BindApp(a, &buf)
+	c.Assert(err, check.IsNil)
+	c.Assert(buf.String(), check.Matches, "add instance")
+	c.Assert(reqs, check.HasLen, 3)
+	c.Assert(reqs[0].Method, check.Equals, "POST")
+	c.Assert(reqs[0].URL.Path, check.Equals, "/resources/my-mysql/bind-app")
+	c.Assert(reqs[1].Method, check.Equals, "POST")
+	c.Assert(reqs[1].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	c.Assert(reqs[2].Method, check.Equals, "POST")
+	c.Assert(reqs[2].URL.Path, check.Equals, "/resources/my-mysql/bind")
+	siDB, err := GetServiceInstance(si.Name, s.user)
+	c.Assert(err, check.IsNil)
+	c.Assert(siDB.Apps, check.DeepEquals, []string{"myapp"})
+	c.Assert(a.GetInstances("mysql"), check.DeepEquals, []bind.ServiceInstance{
+		{Name: "my-mysql", Envs: map[string]string{"ENV1": "VAL1", "ENV2": "VAL2"}},
+	})
+}
+
+func (s *InstanceSuite) TestBindAppMultipleApps(c *check.C) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(4))
+	var reqs []*http.Request
+	var mut sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mut.Lock()
+		defer mut.Unlock()
+		reqs = append(reqs, r)
+		w.WriteHeader(http.StatusOK)
+		if r.URL.Path == "/resources/my-mysql/bind-app" && r.Method == "POST" {
+			w.Write([]byte(`{"ENV1": "VAL1", "ENV2": "VAL2"}`))
+		}
+	}))
+	defer ts.Close()
+	serv := Service{Name: "mysql", Endpoint: map[string]string{"production": ts.URL}}
+	err := serv.Create()
+	c.Assert(err, check.IsNil)
+	si := ServiceInstance{
+		Name:        "my-mysql",
+		ServiceName: "mysql",
+		Teams:       []string{s.team.Name},
+	}
+	err = si.Create()
+	c.Assert(err, check.IsNil)
+	var apps []bind.App
+	var expectedNames []string
+	for i := 0; i < 100; i++ {
+		name := fmt.Sprintf("myapp-%02d", i)
+		expectedNames = append(expectedNames, name)
+		apps = append(apps, provisiontest.NewFakeApp(name, "static", 2))
+	}
+	wg := sync.WaitGroup{}
+	for _, app := range apps {
+		wg.Add(1)
+		go func(app bind.App) {
+			defer wg.Done()
+			var buf bytes.Buffer
+			err := si.BindApp(app, &buf)
+			c.Assert(err, check.IsNil)
+		}(app)
+	}
+	wg.Wait()
+	c.Assert(reqs, check.HasLen, 300)
+	siDB, err := GetServiceInstance(si.Name, s.user)
+	c.Assert(err, check.IsNil)
+	sort.Strings(siDB.Apps)
+	c.Assert(siDB.Apps, check.DeepEquals, expectedNames)
+}
+
+func (s *InstanceSuite) TestUnbindAppMultipleApps(c *check.C) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(4))
+	var reqs []*http.Request
+	var mut sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mut.Lock()
+		defer mut.Unlock()
+		reqs = append(reqs, r)
+		w.WriteHeader(http.StatusOK)
+		if r.URL.Path == "/resources/my-mysql/bind-app" && r.Method == "POST" {
+			w.Write([]byte(`{"ENV1": "VAL1", "ENV2": "VAL2"}`))
+		}
+	}))
+	defer ts.Close()
+	serv := Service{Name: "mysql", Endpoint: map[string]string{"production": ts.URL}}
+	err := serv.Create()
+	c.Assert(err, check.IsNil)
+	si := ServiceInstance{
+		Name:        "my-mysql",
+		ServiceName: "mysql",
+		Teams:       []string{s.team.Name},
+	}
+	err = si.Create()
+	c.Assert(err, check.IsNil)
+	var apps []bind.App
+	for i := 0; i < 100; i++ {
+		name := fmt.Sprintf("myapp-%02d", i)
+		app := provisiontest.NewFakeApp(name, "static", 2)
+		apps = append(apps, app)
+		var buf bytes.Buffer
+		err := si.BindApp(app, &buf)
+		c.Assert(err, check.IsNil)
+	}
+	siDB, err := GetServiceInstance(si.Name, s.user)
+	c.Assert(err, check.IsNil)
+	wg := sync.WaitGroup{}
+	for _, app := range apps {
+		wg.Add(1)
+		go func(app bind.App) {
+			defer wg.Done()
+			var buf bytes.Buffer
+			err := siDB.UnbindApp(app, &buf)
+			c.Assert(err, check.IsNil)
+		}(app)
+	}
+	wg.Wait()
+	c.Assert(reqs, check.HasLen, 600)
+	siDB, err = GetServiceInstance(si.Name, s.user)
+	c.Assert(err, check.IsNil)
+	sort.Strings(siDB.Apps)
+	c.Assert(siDB.Apps, check.DeepEquals, []string{})
 }

@@ -5,12 +5,16 @@
 package service
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"sync"
 	"sync/atomic"
 
 	"github.com/tsuru/tsuru/action"
 	"github.com/tsuru/tsuru/app/bind"
+	"github.com/tsuru/tsuru/errors"
 	"github.com/tsuru/tsuru/provision/provisiontest"
 	"gopkg.in/check.v1"
 	"gopkg.in/mgo.v2/bson"
@@ -163,7 +167,7 @@ func (s *S) TestInsertServiceInstanceBackwardParams(c *check.C) {
 	defer s.conn.ServiceInstances().Remove(bson.M{"name": instance.Name})
 }
 
-func (s *S) TestAddAppToServiceInstanceForward(c *check.C) {
+func (s *S) TestBindAppDBActionForward(c *check.C) {
 	si := ServiceInstance{Name: "mysql"}
 	err := s.conn.ServiceInstances().Insert(&si)
 	c.Assert(err, check.IsNil)
@@ -171,40 +175,29 @@ func (s *S) TestAddAppToServiceInstanceForward(c *check.C) {
 	a := provisiontest.NewFakeApp("myapp", "static", 1)
 	defer s.conn.Apps().Remove(bson.M{"name": a.GetName()})
 	ctx := action.FWContext{
-		Params: []interface{}{a, si},
+		Params: []interface{}{&bindPipelineArgs{app: a, serviceInstance: &si}},
 	}
-	_, err = addAppToServiceInstance.Forward(ctx)
+	_, err = bindAppDBAction.Forward(ctx)
 	c.Assert(err, check.IsNil)
 	err = s.conn.ServiceInstances().Find(bson.M{"name": si.Name}).One(&si)
 	c.Assert(err, check.IsNil)
 	c.Assert(len(si.Apps), check.Equals, 1)
 }
 
-func (s *S) TestAddAppToServiceInstanceForwardInvalidServiceInstance(c *check.C) {
-	a := provisiontest.NewFakeApp("myapp", "static", 1)
-	defer s.conn.Apps().Remove(bson.M{"name": a.GetName()})
-	ctx := action.FWContext{
-		Params: []interface{}{a, "wrong parameter"},
-	}
-	_, err := addAppToServiceInstance.Forward(ctx)
-	c.Assert(err, check.Not(check.IsNil))
-	c.Assert(err, check.ErrorMatches, "^Second parameter must be a ServiceInstance.$")
-}
-
-func (s *S) TestAddAppToServiceInstanceForwardInvalidApp(c *check.C) {
+func (s *S) TestBindAppDBActionForwardInvalidParam(c *check.C) {
 	si := ServiceInstance{Name: "mysql"}
 	err := s.conn.ServiceInstances().Insert(&si)
 	c.Assert(err, check.IsNil)
 	defer s.conn.ServiceInstances().Remove(bson.M{"name": si.Name})
 	ctx := action.FWContext{
-		Params: []interface{}{"wrong parameter", si},
+		Params: []interface{}{"wrong parameter"},
 	}
-	_, err = addAppToServiceInstance.Forward(ctx)
+	_, err = bindAppDBAction.Forward(ctx)
 	c.Assert(err, check.Not(check.IsNil))
-	c.Assert(err, check.ErrorMatches, "^First parameter must be a bind.App.$")
+	c.Assert(err, check.ErrorMatches, "^invalid arguments for pipeline, expected \\*bindPipelineArgs$")
 }
 
-func (s *S) TestAddAppToServiceInstanceForwardTwice(c *check.C) {
+func (s *S) TestBindAppDBActionForwardTwice(c *check.C) {
 	si := ServiceInstance{Name: "mysql"}
 	err := s.conn.ServiceInstances().Insert(&si)
 	c.Assert(err, check.IsNil)
@@ -212,37 +205,31 @@ func (s *S) TestAddAppToServiceInstanceForwardTwice(c *check.C) {
 	a := provisiontest.NewFakeApp("myapp", "static", 1)
 	defer s.conn.Apps().Remove(bson.M{"name": a.GetName()})
 	ctx := action.FWContext{
-		Params: []interface{}{a, si},
+		Params: []interface{}{&bindPipelineArgs{app: a, serviceInstance: &si}},
 	}
-	_, err = addAppToServiceInstance.Forward(ctx)
+	_, err = bindAppDBAction.Forward(ctx)
 	c.Assert(err, check.IsNil)
-	_, err = addAppToServiceInstance.Forward(ctx)
-	c.Assert(err, check.Not(check.IsNil))
+	_, err = bindAppDBAction.Forward(ctx)
+	c.Assert(err, check.NotNil)
 	c.Assert(err, check.ErrorMatches, "^This app is already bound to this service instance.$")
 }
 
-func (s *S) TestAddAppToServiceInstanceBackwardRemovesAppFromServiceInstance(c *check.C) {
-	si := ServiceInstance{Name: "mysql"}
+func (s *S) TestBindAppDBActionBackwardRemovesAppFromServiceInstance(c *check.C) {
+	a := provisiontest.NewFakeApp("myapp", "static", 1)
+	si := ServiceInstance{Name: "mysql", Apps: []string{a.GetName()}}
 	err := s.conn.ServiceInstances().Insert(&si)
 	c.Assert(err, check.IsNil)
-	defer s.conn.ServiceInstances().Remove(bson.M{"name": si.Name})
-	a := provisiontest.NewFakeApp("myapp", "static", 1)
-	defer s.conn.Apps().Remove(bson.M{"name": a.GetName()})
-	err = si.AddApp(a.GetName())
-	c.Assert(err, check.IsNil)
-	err = si.update(nil)
-	c.Assert(err, check.IsNil)
 	ctx := action.BWContext{
-		Params: []interface{}{a, si},
+		Params: []interface{}{&bindPipelineArgs{app: a, serviceInstance: &si}},
 	}
-	addAppToServiceInstance.Backward(ctx)
+	bindAppDBAction.Backward(ctx)
 	c.Assert(err, check.IsNil)
 	err = s.conn.ServiceInstances().Find(bson.M{"name": si.Name}).One(&si)
 	c.Assert(err, check.IsNil)
 	c.Assert(len(si.Apps), check.Equals, 0)
 }
 
-func (s *S) TestSetBindAppActionForwardReturnsEnvVars(c *check.C) {
+func (s *S) TestBindAppEndpointActionForwardReturnsEnvVars(c *check.C) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"DATABASE_USER":"root","DATABASE_PASSWORD":"s3cr3t"}`))
 	}))
@@ -261,9 +248,9 @@ func (s *S) TestSetBindAppActionForwardReturnsEnvVars(c *check.C) {
 	defer s.conn.ServiceInstances().RemoveId(si.Name)
 	a := provisiontest.NewFakeApp("myapp", "static", 1)
 	ctx := action.FWContext{
-		Params: []interface{}{a, si},
+		Params: []interface{}{&bindPipelineArgs{app: a, serviceInstance: &si}},
 	}
-	envs, err := setBindAppAction.Forward(ctx)
+	envs, err := bindAppEndpointAction.Forward(ctx)
 	c.Assert(err, check.IsNil)
 	c.Assert(envs, check.DeepEquals, map[string]string{
 		"DATABASE_USER":     "root",
@@ -271,7 +258,7 @@ func (s *S) TestSetBindAppActionForwardReturnsEnvVars(c *check.C) {
 	})
 }
 
-func (s *S) TestSetBindAppActionBackward(c *check.C) {
+func (s *S) TestBindAppEndpointActionBackward(c *check.C) {
 	var called bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
@@ -292,25 +279,25 @@ func (s *S) TestSetBindAppActionBackward(c *check.C) {
 	defer s.conn.ServiceInstances().RemoveId(si.Name)
 	a := provisiontest.NewFakeApp("myapp", "static", 1)
 	bwCtx := action.BWContext{
-		Params:   []interface{}{a, si},
+		Params:   []interface{}{&bindPipelineArgs{app: a, serviceInstance: &si}},
 		FWResult: nil,
 	}
-	setBindAppAction.Backward(bwCtx)
+	bindAppEndpointAction.Backward(bwCtx)
 	c.Assert(called, check.Equals, true)
 }
 
-func (s *S) TestSetTsuruServicesName(c *check.C) {
-	c.Assert(setTsuruServices.Name, check.Equals, "set-TSURU_SERVICES-env-var")
+func (s *S) TestSetBindedEnvsActionName(c *check.C) {
+	c.Assert(setBindedEnvsAction.Name, check.Equals, "set-binded-envs")
 }
 
-func (s *S) TestSetTsuruServicesForward(c *check.C) {
+func (s *S) TestSetBindedEnvsActionForward(c *check.C) {
 	si := ServiceInstance{Name: "my-mysql", ServiceName: "mysql"}
 	a := provisiontest.NewFakeApp("myapp", "static", 1)
 	ctx := action.FWContext{
-		Params:   []interface{}{a, si},
+		Params:   []interface{}{&bindPipelineArgs{app: a, serviceInstance: &si}},
 		Previous: map[string]string{"DATABASE_NAME": "mydb", "DATABASE_USER": "root"},
 	}
-	result, err := setTsuruServices.Forward(ctx)
+	result, err := setBindedEnvsAction.Forward(ctx)
 	c.Assert(err, check.IsNil)
 	instance := bind.ServiceInstance{
 		Name: "my-mysql",
@@ -321,21 +308,13 @@ func (s *S) TestSetTsuruServicesForward(c *check.C) {
 	c.Assert(instances, check.DeepEquals, []bind.ServiceInstance{instance})
 }
 
-func (s *S) TestSetTsuruServicesForwardWrongFirstParameter(c *check.C) {
-	si := ServiceInstance{Name: "my-mysql", ServiceName: "mysql"}
-	ctx := action.FWContext{Params: []interface{}{"something", si}}
-	_, err := setTsuruServices.Forward(ctx)
-	c.Assert(err.Error(), check.Equals, "First parameter must be a bind.App.")
+func (s *S) TestSetBindedEnvsActionForwardWrongParameter(c *check.C) {
+	ctx := action.FWContext{Params: []interface{}{"something"}}
+	_, err := setBindedEnvsAction.Forward(ctx)
+	c.Assert(err.Error(), check.Equals, "invalid arguments for pipeline, expected *bindPipelineArgs")
 }
 
-func (s *S) TestSetTsuruServicesForwardWrongSecondParameter(c *check.C) {
-	a := provisiontest.NewFakeApp("myapp", "python", 1)
-	ctx := action.FWContext{Params: []interface{}{a, "something"}}
-	_, err := setTsuruServices.Forward(ctx)
-	c.Assert(err.Error(), check.Equals, "Second parameter must be a ServiceInstance.")
-}
-
-func (s *S) TestSetTsuruServicesBackward(c *check.C) {
+func (s *S) TestSetBindedEnvsActionBackward(c *check.C) {
 	instance := bind.ServiceInstance{
 		Name: "my-mysql",
 		Envs: map[string]string{"DATABASE_NAME": "mydb", "DATABASE_USER": "root"},
@@ -345,10 +324,280 @@ func (s *S) TestSetTsuruServicesBackward(c *check.C) {
 	err := a.AddInstance("mysql", instance, nil)
 	c.Assert(err, check.IsNil)
 	ctx := action.BWContext{
-		Params:   []interface{}{a, si},
+		Params:   []interface{}{&bindPipelineArgs{app: a, serviceInstance: &si}},
 		FWResult: instance,
 	}
-	setTsuruServices.Backward(ctx)
+	setBindedEnvsAction.Backward(ctx)
 	instances := a.GetInstances("mysql")
 	c.Assert(instances, check.HasLen, 0)
+}
+
+func (s *S) TestUnbindUnitsForward(c *check.C) {
+	var reqs []*http.Request
+	var reqLock sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqLock.Lock()
+		defer reqLock.Unlock()
+		reqs = append(reqs, r)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	srv := Service{Name: "mysql", Endpoint: map[string]string{"production": ts.URL}}
+	err := s.conn.Services().Insert(&srv)
+	c.Assert(err, check.IsNil)
+	si := ServiceInstance{Name: "my-mysql", ServiceName: "mysql", Teams: []string{s.team.Name}}
+	err = s.conn.ServiceInstances().Insert(&si)
+	c.Assert(err, check.IsNil)
+	a := provisiontest.NewFakeApp("myapp", "static", 10)
+	units, err := a.Units()
+	c.Assert(err, check.IsNil)
+	for i := range units {
+		err = si.BindUnit(a, &units[i])
+		c.Assert(err, check.IsNil)
+	}
+	buf := bytes.NewBuffer(nil)
+	args := bindPipelineArgs{
+		app:             a,
+		serviceInstance: &si,
+		writer:          buf,
+	}
+	ctx := action.FWContext{Params: []interface{}{&args}}
+	_, err = unbindUnits.Forward(ctx)
+	c.Assert(err, check.IsNil)
+	c.Assert(reqs, check.HasLen, 20)
+	for i, req := range reqs {
+		if i < 10 {
+			c.Assert(req.Method, check.Equals, "POST")
+		} else {
+			c.Assert(req.Method, check.Equals, "DELETE")
+		}
+	}
+	siDB, err := GetServiceInstance(si.Name, s.user)
+	c.Assert(err, check.IsNil)
+	c.Assert(siDB.Units, check.DeepEquals, []string{})
+}
+
+func (s *S) TestUnbindUnitsForwardPartialFailure(c *check.C) {
+	var reqs []*http.Request
+	var reqLock sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqLock.Lock()
+		defer reqLock.Unlock()
+		reqs = append(reqs, r)
+		if len(reqs) > 14 && len(reqs) <= 20 {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("my error"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	srv := Service{Name: "mysql", Endpoint: map[string]string{"production": ts.URL}}
+	err := s.conn.Services().Insert(&srv)
+	c.Assert(err, check.IsNil)
+	si := ServiceInstance{Name: "my-mysql", ServiceName: "mysql", Teams: []string{s.team.Name}}
+	err = s.conn.ServiceInstances().Insert(&si)
+	c.Assert(err, check.IsNil)
+	a := provisiontest.NewFakeApp("myapp", "static", 10)
+	units, err := a.Units()
+	c.Assert(err, check.IsNil)
+	for i := range units {
+		err = si.BindUnit(a, &units[i])
+		c.Assert(err, check.IsNil)
+	}
+	buf := bytes.NewBuffer(nil)
+	args := bindPipelineArgs{
+		app:             a,
+		serviceInstance: &si,
+		writer:          buf,
+	}
+	ctx := action.FWContext{Params: []interface{}{&args}}
+	_, err = unbindUnits.Forward(ctx)
+	c.Assert(err, check.DeepEquals, &errors.HTTP{Code: 500, Message: "Failed to unbind (\"/resources/my-mysql/bind\"): my error"})
+	c.Assert(reqs, check.HasLen, 24)
+	for i, req := range reqs {
+		if i < 10 {
+			c.Assert(req.Method, check.Equals, "POST")
+		} else if i < 20 {
+			c.Assert(req.Method, check.Equals, "DELETE")
+		} else {
+			c.Assert(req.Method, check.Equals, "POST")
+		}
+	}
+	siDB, err := GetServiceInstance(si.Name, s.user)
+	c.Assert(err, check.IsNil)
+	sort.Strings(siDB.Units)
+	c.Assert(siDB.Units, check.DeepEquals, []string{
+		"myapp-0",
+		"myapp-1",
+		"myapp-2",
+		"myapp-3",
+		"myapp-4",
+		"myapp-5",
+		"myapp-6",
+		"myapp-7",
+		"myapp-8",
+		"myapp-9",
+	})
+}
+
+func (s *S) TestUnbindUnitsBackward(c *check.C) {
+	var reqs []*http.Request
+	var reqLock sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqLock.Lock()
+		defer reqLock.Unlock()
+		reqs = append(reqs, r)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	srv := Service{Name: "mysql", Endpoint: map[string]string{"production": ts.URL}}
+	err := s.conn.Services().Insert(&srv)
+	c.Assert(err, check.IsNil)
+	si := ServiceInstance{Name: "my-mysql", ServiceName: "mysql", Teams: []string{s.team.Name}}
+	err = s.conn.ServiceInstances().Insert(&si)
+	c.Assert(err, check.IsNil)
+	a := provisiontest.NewFakeApp("myapp", "static", 4)
+	buf := bytes.NewBuffer(nil)
+	args := bindPipelineArgs{
+		app:             a,
+		serviceInstance: &si,
+		writer:          buf,
+	}
+	ctx := action.BWContext{Params: []interface{}{&args}}
+	unbindUnits.Backward(ctx)
+	c.Assert(reqs, check.HasLen, 4)
+	for _, req := range reqs {
+		c.Assert(req.Method, check.Equals, "POST")
+	}
+	siDB, err := GetServiceInstance(si.Name, s.user)
+	c.Assert(err, check.IsNil)
+	sort.Strings(siDB.Units)
+	c.Assert(siDB.Units, check.DeepEquals, []string{
+		"myapp-0",
+		"myapp-1",
+		"myapp-2",
+		"myapp-3",
+	})
+}
+
+func (s *S) TestUnbindAppDBForward(c *check.C) {
+	a := provisiontest.NewFakeApp("myapp", "static", 4)
+	srv := Service{Name: "mysql"}
+	err := s.conn.Services().Insert(&srv)
+	c.Assert(err, check.IsNil)
+	si := ServiceInstance{Name: "my-mysql", ServiceName: "mysql", Teams: []string{s.team.Name}, Apps: []string{a.GetName()}}
+	err = s.conn.ServiceInstances().Insert(&si)
+	c.Assert(err, check.IsNil)
+	buf := bytes.NewBuffer(nil)
+	args := bindPipelineArgs{
+		app:             a,
+		serviceInstance: &si,
+		writer:          buf,
+	}
+	ctx := action.FWContext{Params: []interface{}{&args}}
+	_, err = unbindAppDB.Forward(ctx)
+	c.Assert(err, check.IsNil)
+	siDB, err := GetServiceInstance(si.Name, s.user)
+	c.Assert(err, check.IsNil)
+	c.Assert(siDB.Apps, check.DeepEquals, []string{})
+}
+
+func (s *S) TestUnbindAppDBBackward(c *check.C) {
+	a := provisiontest.NewFakeApp("myapp", "static", 4)
+	srv := Service{Name: "mysql"}
+	err := s.conn.Services().Insert(&srv)
+	c.Assert(err, check.IsNil)
+	si := ServiceInstance{Name: "my-mysql", ServiceName: "mysql", Teams: []string{s.team.Name}}
+	err = s.conn.ServiceInstances().Insert(&si)
+	c.Assert(err, check.IsNil)
+	buf := bytes.NewBuffer(nil)
+	args := bindPipelineArgs{
+		app:             a,
+		serviceInstance: &si,
+		writer:          buf,
+	}
+	ctx := action.BWContext{Params: []interface{}{&args}}
+	unbindAppDB.Backward(ctx)
+	siDB, err := GetServiceInstance(si.Name, s.user)
+	c.Assert(err, check.IsNil)
+	c.Assert(siDB.Apps, check.DeepEquals, []string{a.GetName()})
+}
+
+func (s *S) TestUnbindAppEndpointForward(c *check.C) {
+	var reqs []*http.Request
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs = append(reqs, r)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	a := provisiontest.NewFakeApp("myapp", "static", 4)
+	srv := Service{Name: "mysql", Endpoint: map[string]string{"production": ts.URL}}
+	err := s.conn.Services().Insert(&srv)
+	c.Assert(err, check.IsNil)
+	si := ServiceInstance{Name: "my-mysql", ServiceName: "mysql", Teams: []string{s.team.Name}}
+	err = s.conn.ServiceInstances().Insert(&si)
+	c.Assert(err, check.IsNil)
+	buf := bytes.NewBuffer(nil)
+	args := bindPipelineArgs{
+		app:             a,
+		serviceInstance: &si,
+		writer:          buf,
+	}
+	ctx := action.FWContext{Params: []interface{}{&args}}
+	_, err = unbindAppEndpoint.Forward(ctx)
+	c.Assert(err, check.IsNil)
+	c.Assert(reqs, check.HasLen, 1)
+	c.Assert(reqs[0].Method, check.Equals, "DELETE")
+	c.Assert(reqs[0].URL.Path, check.Equals, "/resources/my-mysql/bind-app")
+}
+
+func (s *S) TestUnbindAppEndpointBackward(c *check.C) {
+	var reqs []*http.Request
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs = append(reqs, r)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	a := provisiontest.NewFakeApp("myapp", "static", 4)
+	srv := Service{Name: "mysql", Endpoint: map[string]string{"production": ts.URL}}
+	err := s.conn.Services().Insert(&srv)
+	c.Assert(err, check.IsNil)
+	si := ServiceInstance{Name: "my-mysql", ServiceName: "mysql", Teams: []string{s.team.Name}}
+	err = s.conn.ServiceInstances().Insert(&si)
+	c.Assert(err, check.IsNil)
+	buf := bytes.NewBuffer(nil)
+	args := bindPipelineArgs{
+		app:             a,
+		serviceInstance: &si,
+		writer:          buf,
+	}
+	ctx := action.BWContext{Params: []interface{}{&args}}
+	unbindAppEndpoint.Backward(ctx)
+	c.Assert(reqs, check.HasLen, 1)
+	c.Assert(reqs[0].Method, check.Equals, "POST")
+	c.Assert(reqs[0].URL.Path, check.Equals, "/resources/my-mysql/bind-app")
+}
+
+func (s *S) TestRemoveBindedEnvsForward(c *check.C) {
+	a := provisiontest.NewFakeApp("myapp", "static", 4)
+	srv := Service{Name: "mysql"}
+	err := s.conn.Services().Insert(&srv)
+	c.Assert(err, check.IsNil)
+	si := ServiceInstance{Name: "my-mysql", ServiceName: "mysql", Teams: []string{s.team.Name}}
+	err = s.conn.ServiceInstances().Insert(&si)
+	c.Assert(err, check.IsNil)
+	instance := bind.ServiceInstance{Name: si.Name, Envs: map[string]string{"ENV1": "VAL1", "ENV2": "VAL2"}}
+	err = a.AddInstance(si.ServiceName, instance, nil)
+	c.Assert(err, check.IsNil)
+	buf := bytes.NewBuffer(nil)
+	args := bindPipelineArgs{
+		app:             a,
+		serviceInstance: &si,
+		writer:          buf,
+	}
+	ctx := action.FWContext{Params: []interface{}{&args}}
+	_, err = removeBindedEnvs.Forward(ctx)
+	c.Assert(err, check.IsNil)
+	c.Assert(a.GetInstances("mysql"), check.DeepEquals, []bind.ServiceInstance{})
 }

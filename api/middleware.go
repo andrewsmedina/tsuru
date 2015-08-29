@@ -22,9 +22,9 @@ import (
 )
 
 const (
-	tsuruMin      = "0.16.0"
+	tsuruMin      = "0.17.0"
 	craneMin      = "0.7.0"
-	tsuruAdminMin = "0.10.0"
+	tsuruAdminMin = "0.11.0"
 )
 
 func validate(token string, r *http.Request) (auth.Token, error) {
@@ -44,7 +44,7 @@ func validate(token string, r *http.Request) (auth.Token, error) {
 		}
 	} else if user, err := t.User(); err == nil {
 		if q := r.URL.Query().Get(":app"); q != "" {
-			_, err = getApp(q, user)
+			_, err = getApp(q, user, r)
 			if err != nil {
 				return nil, err
 			}
@@ -89,7 +89,7 @@ func errorHandlingMiddleware(w http.ResponseWriter, r *http.Request, next http.H
 		} else {
 			http.Error(w, err.Error(), code)
 		}
-		log.Error(err.Error())
+		log.Errorf("failure running HTTP request %s %s (%d): %s", r.Method, r.URL.Path, code, err)
 	}
 }
 

@@ -16,12 +16,14 @@ import (
 	"github.com/tsuru/tsuru/action"
 	"github.com/tsuru/tsuru/log"
 	"github.com/tsuru/tsuru/provision"
+	"github.com/tsuru/tsuru/provision/docker/container"
 	"github.com/tsuru/tsuru/router"
 	"gopkg.in/mgo.v2/bson"
 )
 
 type runContainerActionsArgs struct {
 	app              provision.App
+	processName      string
 	imageID          string
 	commands         []string
 	destinationHosts []string
@@ -31,17 +33,27 @@ type runContainerActionsArgs struct {
 	provisioner      *dockerProvisioner
 }
 
+type containersToAdd struct {
+	Quantity int
+	Status   provision.Status
+}
+
 type changeUnitsPipelineArgs struct {
 	app         provision.App
 	writer      io.Writer
-	toRemove    []container
-	unitsToAdd  int
+	toAdd       map[string]*containersToAdd
+	toRemove    []container.Container
 	toHost      string
 	imageId     string
 	provisioner *dockerProvisioner
+	appDestroy  bool
 }
 
-func runInContainers(containers []container, callback func(*container, chan *container) error, rollback func(*container), parallel bool) error {
+type callbackFunc func(*container.Container, chan *container.Container) error
+
+type rollbackFunc func(*container.Container)
+
+func runInContainers(containers []container.Container, callback callbackFunc, rollback rollbackFunc, parallel bool) error {
 	if len(containers) == 0 {
 		return nil
 	}
@@ -50,7 +62,7 @@ func runInContainers(containers []container, callback func(*container, chan *con
 		workers = len(containers)
 	}
 	step := len(containers)/workers + 1
-	toRollback := make(chan *container, len(containers))
+	toRollback := make(chan *container.Container, len(containers))
 	errors := make(chan error, len(containers))
 	var wg sync.WaitGroup
 	runFunc := func(start, end int) error {
@@ -98,15 +110,16 @@ var insertEmptyContainerInDB = action.Action{
 	Forward: func(ctx action.FWContext) (action.Result, error) {
 		args := ctx.Params[0].(runContainerActionsArgs)
 		contName := args.app.GetName() + "-" + randomString()
-		cont := container{
+		cont := container.Container{
 			AppName:       args.app.GetName(),
+			ProcessName:   args.processName,
 			Type:          args.app.GetPlatform(),
 			Name:          contName,
 			Status:        provision.StatusCreated.String(),
 			Image:         args.imageID,
 			BuildingImage: args.buildingImage,
 		}
-		coll := args.provisioner.collection()
+		coll := args.provisioner.Collection()
 		defer coll.Close()
 		if err := coll.Insert(cont); err != nil {
 			log.Errorf("error on inserting container into database %s - %s", cont.Name, err)
@@ -115,9 +128,9 @@ var insertEmptyContainerInDB = action.Action{
 		return cont, nil
 	},
 	Backward: func(ctx action.BWContext) {
-		c := ctx.FWResult.(container)
+		c := ctx.FWResult.(container.Container)
 		args := ctx.Params[0].(runContainerActionsArgs)
-		coll := args.provisioner.collection()
+		coll := args.provisioner.Collection()
 		defer coll.Close()
 		coll.Remove(bson.M{"name": c.Name})
 	},
@@ -127,9 +140,9 @@ var updateContainerInDB = action.Action{
 	Name: "update-database-container",
 	Forward: func(ctx action.FWContext) (action.Result, error) {
 		args := ctx.Params[0].(runContainerActionsArgs)
-		coll := args.provisioner.collection()
+		coll := args.provisioner.Collection()
 		defer coll.Close()
-		cont := ctx.Previous.(container)
+		cont := ctx.Previous.(container.Container)
 		err := coll.Update(bson.M{"name": cont.Name}, cont)
 		if err != nil {
 			log.Errorf("error on updating container into database %s - %s", cont.ID, err)
@@ -144,10 +157,18 @@ var updateContainerInDB = action.Action{
 var createContainer = action.Action{
 	Name: "create-container",
 	Forward: func(ctx action.FWContext) (action.Result, error) {
-		cont := ctx.Previous.(container)
+		cont := ctx.Previous.(container.Container)
 		args := ctx.Params[0].(runContainerActionsArgs)
 		log.Debugf("create container for app %s, based on image %s, with cmds %s", args.app.GetName(), args.imageID, args.commands)
-		err := cont.create(args)
+		err := cont.Create(&container.CreateArgs{
+			ImageID:          args.imageID,
+			Commands:         args.commands,
+			App:              args.app,
+			Deploy:           args.isDeploy,
+			Provisioner:      args.provisioner,
+			DestinationHosts: args.destinationHosts,
+			ProcessName:      args.processName,
+		})
 		if err != nil {
 			log.Errorf("error on create container for app %s - %s", args.app.GetName(), err)
 			return nil, err
@@ -155,21 +176,34 @@ var createContainer = action.Action{
 		return cont, nil
 	},
 	Backward: func(ctx action.BWContext) {
-		c := ctx.FWResult.(container)
+		c := ctx.FWResult.(container.Container)
 		args := ctx.Params[0].(runContainerActionsArgs)
-		err := args.provisioner.getCluster().RemoveContainer(docker.RemoveContainerOptions{ID: c.ID})
+		err := args.provisioner.Cluster().RemoveContainer(docker.RemoveContainerOptions{ID: c.ID})
 		if err != nil {
 			log.Errorf("Failed to remove the container %q: %s", c.ID, err)
 		}
 	},
 }
 
+var stopContainer = action.Action{
+	Name: "stop-container",
+	Forward: func(ctx action.FWContext) (action.Result, error) {
+		cont := ctx.Previous.(container.Container)
+		cont.Status = provision.StatusStopped.String()
+		return cont, nil
+	},
+	Backward: func(ctx action.BWContext) {
+		c := ctx.FWResult.(container.Container)
+		c.Status = provision.StatusCreated.String()
+	},
+}
+
 var setNetworkInfo = action.Action{
 	Name: "set-network-info",
 	Forward: func(ctx action.FWContext) (action.Result, error) {
-		c := ctx.Previous.(container)
+		c := ctx.Previous.(container.Container)
 		args := ctx.Params[0].(runContainerActionsArgs)
-		info, err := c.networkInfo(args.provisioner)
+		info, err := c.NetworkInfo(args.provisioner)
 		if err != nil {
 			return nil, err
 		}
@@ -182,10 +216,14 @@ var setNetworkInfo = action.Action{
 var startContainer = action.Action{
 	Name: "start-container",
 	Forward: func(ctx action.FWContext) (action.Result, error) {
-		c := ctx.Previous.(container)
+		c := ctx.Previous.(container.Container)
 		log.Debugf("starting container %s", c.ID)
 		args := ctx.Params[0].(runContainerActionsArgs)
-		err := c.start(args.provisioner, args.app, args.isDeploy)
+		err := c.Start(&container.StartArgs{
+			Provisioner: args.provisioner,
+			App:         args.app,
+			Deploy:      args.isDeploy,
+		})
 		if err != nil {
 			log.Errorf("error on start container %s - %s", c.ID, err)
 			return nil, err
@@ -193,13 +231,20 @@ var startContainer = action.Action{
 		return c, nil
 	},
 	Backward: func(ctx action.BWContext) {
-		c := ctx.FWResult.(container)
+		c := ctx.FWResult.(container.Container)
 		args := ctx.Params[0].(runContainerActionsArgs)
-		err := args.provisioner.getCluster().StopContainer(c.ID, 10)
+		err := args.provisioner.Cluster().StopContainer(c.ID, 10)
 		if err != nil {
 			log.Errorf("Failed to stop the container %q: %s", c.ID, err)
 		}
 	},
+}
+
+var rollbackNotice = func(ctx action.FWContext, err error) {
+	args := ctx.Params[0].(changeUnitsPipelineArgs)
+	if args.writer != nil {
+		fmt.Fprintf(args.writer, "\n**** ROLLING BACK AFTER FAILURE ****\n ---> %s <---\n", err)
+	}
 }
 
 var provisionAddUnitsToHost = action.Action{
@@ -214,14 +259,23 @@ var provisionAddUnitsToHost = action.Action{
 	},
 	Backward: func(ctx action.BWContext) {
 		args := ctx.Params[0].(changeUnitsPipelineArgs)
-		containers := ctx.FWResult.([]container)
+		containers := ctx.FWResult.([]container.Container)
+		w := args.writer
+		if w == nil {
+			w = ioutil.Discard
+		}
+		units := len(containers)
+		fmt.Fprintf(w, "\n---- Destroying %d created %s ----\n", units, pluralize("unit", units))
 		for _, cont := range containers {
-			err := cont.remove(args.provisioner)
+			err := cont.Remove(args.provisioner)
 			if err != nil {
 				log.Errorf("Error removing added container %s: %s", cont.ID, err.Error())
+				continue
 			}
+			fmt.Fprintf(w, " ---> Destroyed unit %s [%s]\n", cont.ShortID(), cont.ProcessName)
 		}
 	},
+	OnError:   rollbackNotice,
 	MinParams: 1,
 }
 
@@ -229,31 +283,44 @@ var bindAndHealthcheck = action.Action{
 	Name: "bind-and-healthcheck",
 	Forward: func(ctx action.FWContext) (action.Result, error) {
 		args := ctx.Params[0].(changeUnitsPipelineArgs)
-		newContainers := ctx.Previous.([]container)
+		webProcessName, err := getImageWebProcessName(args.imageId)
+		if err != nil {
+			log.Errorf("[WARNING] cannot get the name of the web process: %s", err)
+		}
+		newContainers := ctx.Previous.([]container.Container)
 		writer := args.writer
 		if writer == nil {
 			writer = ioutil.Discard
 		}
-		fmt.Fprintf(writer, "\n---- Binding and checking %d new units ----\n", len(newContainers))
-		return newContainers, runInContainers(newContainers, func(c *container, toRollback chan *container) error {
-			unit := c.asUnit(args.app)
+		doHealthcheck := true
+		for _, c := range args.toRemove {
+			if c.Status == provision.StatusError.String() || c.Status == provision.StatusStopped.String() {
+				doHealthcheck = false
+				break
+			}
+		}
+		fmt.Fprintf(writer, "\n---- Binding and checking %d new %s ----\n", len(newContainers), pluralize("unit", len(newContainers)))
+		return newContainers, runInContainers(newContainers, func(c *container.Container, toRollback chan *container.Container) error {
+			unit := c.AsUnit(args.app)
 			err := args.app.BindUnit(&unit)
 			if err != nil {
 				return err
 			}
 			toRollback <- c
-			err = runHealthcheck(c, writer)
-			if err != nil {
-				return err
+			if doHealthcheck && c.ProcessName == webProcessName {
+				err = runHealthcheck(c, writer)
+				if err != nil {
+					return err
+				}
 			}
 			err = args.provisioner.runRestartAfterHooks(c, writer)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(writer, " ---> Bound and checked unit %s\n", c.shortID())
+			fmt.Fprintf(writer, " ---> Bound and checked unit %s [%s]\n", c.ShortID(), c.ProcessName)
 			return nil
-		}, func(c *container) {
-			unit := c.asUnit(args.app)
+		}, func(c *container.Container) {
+			unit := c.AsUnit(args.app)
 			err := args.app.UnbindUnit(&unit)
 			if err != nil {
 				log.Errorf("Unable to unbind unit %q: %s", c.ID, err)
@@ -262,22 +329,35 @@ var bindAndHealthcheck = action.Action{
 	},
 	Backward: func(ctx action.BWContext) {
 		args := ctx.Params[0].(changeUnitsPipelineArgs)
-		newContainers := ctx.FWResult.([]container)
+		newContainers := ctx.FWResult.([]container.Container)
+		w := args.writer
+		if w == nil {
+			w = ioutil.Discard
+		}
+		units := len(newContainers)
+		fmt.Fprintf(w, "\n---- Unbinding %d created %s ----\n", units, pluralize("unit", units))
 		for _, c := range newContainers {
-			unit := c.asUnit(args.app)
+			unit := c.AsUnit(args.app)
 			err := args.app.UnbindUnit(&unit)
 			if err != nil {
 				log.Errorf("Removed binding for unit %q: %s", c.ID, err)
+				continue
 			}
+			fmt.Fprintf(w, " ---> Unbinded unit %s [%s]\n", c.ShortID(), c.ProcessName)
 		}
 	},
+	OnError: rollbackNotice,
 }
 
 var addNewRoutes = action.Action{
 	Name: "add-new-routes",
 	Forward: func(ctx action.FWContext) (action.Result, error) {
 		args := ctx.Params[0].(changeUnitsPipelineArgs)
-		newContainers := ctx.Previous.([]container)
+		webProcessName, err := getImageWebProcessName(args.imageId)
+		if err != nil {
+			log.Errorf("[WARNING] cannot get the name of the web process: %s", err)
+		}
+		newContainers := ctx.Previous.([]container.Container)
 		r, err := getRouterForApp(args.app)
 		if err != nil {
 			return nil, err
@@ -286,33 +366,55 @@ var addNewRoutes = action.Action{
 		if writer == nil {
 			writer = ioutil.Discard
 		}
-		fmt.Fprintf(writer, "\n---- Adding routes to %d new units ----\n", len(newContainers))
-		return newContainers, runInContainers(newContainers, func(c *container, toRollback chan *container) error {
-			err = r.AddRoute(c.AppName, c.getAddress())
+		if len(newContainers) > 0 {
+			fmt.Fprintf(writer, "\n---- Adding routes to new units ----\n")
+		}
+		// Beware that our routers are NOT thread safe. Hipache router
+		// implementaion in particular does not care with thread safeness.
+		// That's why we do not add routes concurrently here. If we wish to
+		// change this in the future a comprehensive concurrent test suite
+		// must be added to routers first.
+		return newContainers, runInContainers(newContainers, func(c *container.Container, toRollback chan *container.Container) error {
+			if c.ProcessName != webProcessName {
+				return nil
+			}
+			err = r.AddRoute(c.AppName, c.Address())
 			if err != nil {
 				return err
 			}
+			c.Routable = true
 			toRollback <- c
-			fmt.Fprintf(writer, " ---> Added route to unit %s\n", c.shortID())
+			fmt.Fprintf(writer, " ---> Added route to unit %s [%s]\n", c.ShortID(), c.ProcessName)
 			return nil
-		}, func(c *container) {
-			r.RemoveRoute(c.AppName, c.getAddress())
+		}, func(c *container.Container) {
+			r.RemoveRoute(c.AppName, c.Address())
 		}, false)
 	},
 	Backward: func(ctx action.BWContext) {
 		args := ctx.Params[0].(changeUnitsPipelineArgs)
-		newContainers := ctx.FWResult.([]container)
+		newContainers := ctx.FWResult.([]container.Container)
 		r, err := getRouterForApp(args.app)
 		if err != nil {
 			log.Errorf("[add-new-routes:Backward] Error geting router: %s", err.Error())
 		}
+		w := args.writer
+		if w == nil {
+			w = ioutil.Discard
+		}
+		fmt.Fprintf(w, "\n---- Removing routes from created units ----\n")
 		for _, cont := range newContainers {
-			err = r.RemoveRoute(cont.AppName, cont.getAddress())
+			if !cont.Routable {
+				continue
+			}
+			err = r.RemoveRoute(cont.AppName, cont.Address())
 			if err != nil {
 				log.Errorf("[add-new-routes:Backward] Error removing route for %s: %s", cont.ID, err.Error())
+				continue
 			}
+			fmt.Fprintf(w, " ---> Removed route from unit %s [%s]\n", cont.ShortID(), cont.ProcessName)
 		}
 	},
+	OnError: rollbackNotice,
 }
 
 var removeOldRoutes = action.Action{
@@ -327,17 +429,26 @@ var removeOldRoutes = action.Action{
 		if writer == nil {
 			writer = ioutil.Discard
 		}
-		fmt.Fprintf(writer, "\n---- Removing routes from %d old units ----\n", len(args.toRemove))
-		return ctx.Previous, runInContainers(args.toRemove, func(c *container, toRollback chan *container) error {
-			err = r.RemoveRoute(c.AppName, c.getAddress())
-			if err != router.ErrRouteNotFound && err != nil {
-				return err
+		if len(args.toRemove) > 0 {
+			fmt.Fprintf(writer, "\n---- Removing routes from old units ----\n")
+		}
+		return ctx.Previous, runInContainers(args.toRemove, func(c *container.Container, toRollback chan *container.Container) error {
+			err = r.RemoveRoute(c.AppName, c.Address())
+			if err == router.ErrRouteNotFound {
+				return nil
 			}
+			if err != nil {
+				if !args.appDestroy {
+					return err
+				}
+				log.Errorf("ignored error removing route for %q during app %q destroy: %s", c.Address(), c.AppName, err)
+			}
+			c.Routable = true
 			toRollback <- c
-			fmt.Fprintf(writer, " ---> Removed route from unit %s\n", c.shortID())
+			fmt.Fprintf(writer, " ---> Removed route from unit %s [%s]\n", c.ShortID(), c.ProcessName)
 			return nil
-		}, func(c *container) {
-			r.AddRoute(c.AppName, c.getAddress())
+		}, func(c *container.Container) {
+			r.AddRoute(c.AppName, c.Address())
 		}, false)
 	},
 	Backward: func(ctx action.BWContext) {
@@ -346,13 +457,24 @@ var removeOldRoutes = action.Action{
 		if err != nil {
 			log.Errorf("[remove-old-routes:Backward] Error geting router: %s", err.Error())
 		}
+		w := args.writer
+		if w == nil {
+			w = ioutil.Discard
+		}
+		fmt.Fprintf(w, "\n---- Adding back routes to old units ----\n")
 		for _, cont := range args.toRemove {
-			err = r.AddRoute(cont.AppName, cont.getAddress())
+			if !cont.Routable {
+				continue
+			}
+			err = r.AddRoute(cont.AppName, cont.Address())
 			if err != nil {
 				log.Errorf("[remove-old-routes:Backward] Error adding back route for %s: %s", cont.ID, err.Error())
+				continue
 			}
+			fmt.Fprintf(w, " ---> Added route to unit %s [%s]\n", cont.ShortID(), cont.ProcessName)
 		}
 	},
+	OnError:   rollbackNotice,
 	MinParams: 1,
 }
 
@@ -365,23 +487,20 @@ var provisionRemoveOldUnits = action.Action{
 			writer = ioutil.Discard
 		}
 		total := len(args.toRemove)
-		var plural string
-		if total > 1 {
-			plural = "s"
-		}
-		fmt.Fprintf(writer, "\n---- Removing %d old unit%s ----\n", total, plural)
-		runInContainers(args.toRemove, func(c *container, toRollback chan *container) error {
-			err := c.remove(args.provisioner)
+		fmt.Fprintf(writer, "\n---- Removing %d old %s ----\n", total, pluralize("unit", total))
+		runInContainers(args.toRemove, func(c *container.Container, toRollback chan *container.Container) error {
+			err := c.Remove(args.provisioner)
 			if err != nil {
 				log.Errorf("Ignored error trying to remove old container %q: %s", c.ID, err)
 			}
-			fmt.Fprintf(writer, " ---> Removed old unit %s...\n", c.shortID())
+			fmt.Fprintf(writer, " ---> Removed old unit %s [%s]\n", c.ShortID(), c.ProcessName)
 			return nil
 		}, nil, true)
 		return ctx.Previous, nil
 	},
 	Backward: func(ctx action.BWContext) {
 	},
+	OnError:   rollbackNotice,
 	MinParams: 1,
 }
 
@@ -394,40 +513,37 @@ var provisionUnbindOldUnits = action.Action{
 			writer = ioutil.Discard
 		}
 		total := len(args.toRemove)
-		var plural string
-		if total > 1 {
-			plural = "s"
-		}
-		fmt.Fprintf(writer, "\n---- Unbinding %d old unit%s ----\n", total, plural)
-		runInContainers(args.toRemove, func(c *container, toRollback chan *container) error {
-			unit := c.asUnit(args.app)
+		fmt.Fprintf(writer, "\n---- Unbinding %d old %s ----\n", total, pluralize("unit", total))
+		runInContainers(args.toRemove, func(c *container.Container, toRollback chan *container.Container) error {
+			unit := c.AsUnit(args.app)
 			err := args.app.UnbindUnit(&unit)
 			if err != nil {
-				log.Errorf("Ignorer error trying to unbind old container %q: %s", c.ID, err)
+				log.Errorf("Ignored error trying to unbind old container %q: %s", c.ID, err)
 			}
-			fmt.Fprintf(writer, " ---> Removed bind for old unit %s...\n", c.shortID())
+			fmt.Fprintf(writer, " ---> Removed bind for old unit %s [%s]\n", c.ShortID(), c.ProcessName)
 			return nil
 		}, nil, true)
 		return ctx.Previous, nil
 	}, Backward: func(ctx action.BWContext) {
 	},
+	OnError:   rollbackNotice,
 	MinParams: 1,
 }
 
 var followLogsAndCommit = action.Action{
 	Name: "follow-logs-and-commit",
 	Forward: func(ctx action.FWContext) (action.Result, error) {
-		c, ok := ctx.Previous.(container)
+		c, ok := ctx.Previous.(container.Container)
 		if !ok {
 			return nil, errors.New("Previous result must be a container.")
 		}
 		args := ctx.Params[0].(runContainerActionsArgs)
-		err := c.logs(args.provisioner, args.writer)
+		err := c.Logs(args.provisioner, args.writer)
 		if err != nil {
 			log.Errorf("error on get logs for container %s - %s", c.ID, err)
 			return nil, err
 		}
-		status, err := args.provisioner.getCluster().WaitContainer(c.ID)
+		status, err := args.provisioner.Cluster().WaitContainer(c.ID)
 		if err != nil {
 			log.Errorf("Process failed for container %q: %s", c.ID, err)
 			return nil, err
@@ -436,13 +552,13 @@ var followLogsAndCommit = action.Action{
 			return nil, fmt.Errorf("Exit status %d", status)
 		}
 		fmt.Fprintf(args.writer, "\n---- Building application image ----\n")
-		imageId, err := c.commit(args.provisioner, args.writer)
+		imageId, err := c.Commit(args.provisioner, args.writer)
 		if err != nil {
 			log.Errorf("error on commit container %s - %s", c.ID, err)
 			return nil, err
 		}
 		fmt.Fprintf(args.writer, " ---> Cleaning up\n")
-		c.remove(args.provisioner)
+		c.Remove(args.provisioner)
 		return imageId, nil
 	},
 	Backward: func(ctx action.BWContext) {
@@ -469,7 +585,7 @@ var updateAppImage = action.Action{
 		}
 		for i, imgName := range allImages {
 			if i > len(allImages)-imgHistorySize-1 {
-				err := args.provisioner.getCluster().RemoveImageIgnoreLast(imgName)
+				err := args.provisioner.Cluster().RemoveImageIgnoreLast(imgName)
 				if err != nil {
 					log.Debugf("Ignored error removing old image %q: %s", imgName, err.Error())
 				}
@@ -479,4 +595,5 @@ var updateAppImage = action.Action{
 		}
 		return ctx.Previous, nil
 	},
+	OnError: rollbackNotice,
 }

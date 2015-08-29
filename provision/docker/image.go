@@ -19,6 +19,7 @@ import (
 	"github.com/tsuru/tsuru/provision"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
+	"gopkg.in/yaml.v1"
 )
 
 type appImages struct {
@@ -40,11 +41,11 @@ func MigrateImages() error {
 	if err != nil {
 		return err
 	}
-	dcluster := mainDockerProvisioner.getCluster()
+	dcluster := mainDockerProvisioner.Cluster()
 	for _, app := range apps {
 		oldImage := registry + repoNamespace + "/" + app.Name
 		newImage := registry + repoNamespace + "/app-" + app.Name
-		containers, _ := mainDockerProvisioner.listContainersBy(bson.M{"image": newImage, "appname": app.Name})
+		containers, _ := mainDockerProvisioner.ListContainers(bson.M{"image": newImage, "appname": app.Name})
 		if len(containers) > 0 {
 			continue
 		}
@@ -62,7 +63,7 @@ func MigrateImages() error {
 		}
 		if registry != "" {
 			pushOpts := docker.PushImageOptions{Name: newImage}
-			err = dcluster.PushImage(pushOpts, getRegistryAuthConfig())
+			err = dcluster.PushImage(pushOpts, mainDockerProvisioner.RegistryAuthConfig())
 			if err != nil {
 				return err
 			}
@@ -116,13 +117,65 @@ func imageCustomDataColl() (*dbStorage.Collection, error) {
 	return conn.Collection(fmt.Sprintf("%s_image_custom_data", name)), nil
 }
 
+type ImageMetadata struct {
+	Name       string `bson:"_id"`
+	CustomData map[string]interface{}
+	Processes  map[string]string
+}
+
 func saveImageCustomData(imageName string, customData map[string]interface{}) error {
 	coll, err := imageCustomDataColl()
 	if err != nil {
 		return err
 	}
 	defer coll.Close()
-	return coll.Insert(bson.M{"_id": imageName, "customdata": customData})
+	var processes map[string]string
+	if data, ok := customData["procfile"]; ok {
+		procfile := data.(string)
+		err := yaml.Unmarshal([]byte(procfile), &processes)
+		if err != nil {
+			return err
+		}
+		delete(customData, "procfile")
+	}
+	data := ImageMetadata{
+		Name:       imageName,
+		CustomData: customData,
+		Processes:  processes,
+	}
+	return coll.Insert(data)
+}
+
+func getImageCustomData(imageName string) (ImageMetadata, error) {
+	coll, err := imageCustomDataColl()
+	if err != nil {
+		return ImageMetadata{}, err
+	}
+	defer coll.Close()
+	var data ImageMetadata
+	err = coll.FindId(imageName).One(&data)
+	if err == mgo.ErrNotFound {
+		// Return empty data for compatibillity with really old apps.
+		return data, nil
+	}
+	return data, err
+}
+
+func getImageWebProcessName(imageName string) (string, error) {
+	processName := "web"
+	data, err := getImageCustomData(imageName)
+	if err != nil {
+		return processName, err
+	}
+	if len(data.Processes) == 0 {
+		return "", nil
+	}
+	if len(data.Processes) == 1 {
+		for name := range data.Processes {
+			processName = name
+		}
+	}
+	return processName, nil
 }
 
 func getImageTsuruYamlData(imageName string) (provision.TsuruYamlData, error) {
@@ -135,22 +188,10 @@ func getImageTsuruYamlData(imageName string) (provision.TsuruYamlData, error) {
 	}
 	defer coll.Close()
 	err = coll.FindId(imageName).One(&customData)
-	return customData.Customdata, err
-}
-
-// TODO(cezarsa): This method only exist to keep tsuru compatible with older
-// platforms. It should be deprecated in the next major after 0.10.0.
-func getImageTsuruYamlDataWithFallback(imageName, appName string) (provision.TsuruYamlData, error) {
-	yamlData, err := getImageTsuruYamlData(imageName)
-	if err != nil {
-		a, err := app.GetByName(appName)
-		if err != nil {
-			// Ignored error if app not found
-			return yamlData, nil
-		}
-		return a.GetTsuruYamlData()
+	if err == mgo.ErrNotFound {
+		return customData.Customdata, nil
 	}
-	return yamlData, nil
+	return customData.Customdata, err
 }
 
 func appBasicImageName(appName string) string {
@@ -317,25 +358,18 @@ func basicImageName() string {
 
 func (p *dockerProvisioner) usePlatformImage(app provision.App) bool {
 	deploys := app.GetDeploys()
-	if (deploys != 0 && deploys%10 == 0) || app.GetUpdatePlatform() {
-		return true
-	}
-	c, err := p.getOneContainerByAppName(app.GetName())
-	if err != nil || c.Image == "" {
-		return true
-	}
-	return false
+	return deploys%10 == 0 || app.GetUpdatePlatform()
 }
 
 func (p *dockerProvisioner) cleanImage(appName, imgName string) {
 	shouldRemove := true
-	err := p.getCluster().RemoveImage(imgName)
+	err := p.Cluster().RemoveImage(imgName)
 	if err != nil {
 		shouldRemove = false
 		log.Errorf("Ignored error removing old image %q: %s. Image kept on list to retry later.",
 			imgName, err.Error())
 	}
-	err = p.getCluster().RemoveFromRegistry(imgName)
+	err = p.Cluster().RemoveFromRegistry(imgName)
 	if err != nil {
 		shouldRemove = false
 		log.Errorf("Ignored error removing old image from registry %q: %s. Image kept on list to retry later.",

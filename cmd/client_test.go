@@ -6,7 +6,9 @@ package cmd
 
 import (
 	"bytes"
+	"io/ioutil"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/tsuru/tsuru/cmd/cmdtest"
@@ -72,6 +74,45 @@ func (s *S) TestShouldReturnBodyMessageOnError(c *check.C) {
 			`You can't do this.*`)
 }
 
+func (s *S) TestShouldReturnStatusMessageOnErrorWhenBodyIsEmpty(c *check.C) {
+	request, err := http.NewRequest("GET", "/", nil)
+	c.Assert(err, check.IsNil)
+	var buf bytes.Buffer
+	context := Context{
+		Stdout: &buf,
+	}
+	client := NewClient(
+		&http.Client{
+			Transport: &cmdtest.Transport{
+				Message: "",
+				Status:  http.StatusServiceUnavailable,
+			},
+		},
+		&context,
+		manager)
+	client.Verbosity = 2
+	response, err := client.Do(request)
+	c.Assert(response, check.NotNil)
+	c.Assert(err, check.NotNil)
+	expectedMsg := "503 Service Unavailable"
+	c.Assert(err.Error(), check.Equals, expectedMsg)
+	httpErr, ok := err.(*errors.HTTP)
+	c.Assert(ok, check.Equals, true)
+	c.Assert(httpErr.Code, check.Equals, http.StatusServiceUnavailable)
+	c.Assert(httpErr.Message, check.Equals, expectedMsg)
+	c.Assert(buf.String(), check.Matches,
+		`(?s)`+
+			`.*<Request uri="/">.*`+
+			`GET / HTTP/1.1\r\n.*`+
+			`Connection: close.*`+
+			`Authorization: bearer.*`+
+			`<Response uri="/">.*`+
+			`HTTP/0.0 503 Service Unavailable\r\n`+
+			`Content-Length: 0\r\n`+
+			`\r\n`+
+			`\*+ </Response uri="/">.*`)
+}
+
 func (s *S) TestShouldHandleUnauthorizedErrorSpecially(c *check.C) {
 	request, err := http.NewRequest("GET", "/", nil)
 	c.Assert(err, check.IsNil)
@@ -89,7 +130,8 @@ func (s *S) TestShouldHandleUnauthorizedErrorSpecially(c *check.C) {
 }
 
 func (s *S) TestShouldReturnErrorWhenServerIsDown(c *check.C) {
-	rfs := &fstest.RecordingFs{FileContent: "http://tsuru.google.com"}
+	os.Unsetenv("TSURU_TARGET")
+	rfs := &fstest.RecordingFs{FileContent: "http://tsuru.abc.xyz"}
 	fsystem = rfs
 	defer func() {
 		fsystem = nil
@@ -104,7 +146,7 @@ func (s *S) TestShouldReturnErrorWhenServerIsDown(c *check.C) {
 	client.Verbosity = 2
 	_, err = client.Do(request)
 	c.Assert(err, check.NotNil)
-	c.Assert(err.Error(), check.Equals, "Failed to connect to tsuru server (http://tsuru.google.com), it's probably down.")
+	c.Assert(err.Error(), check.Equals, "Failed to connect to tsuru server (http://tsuru.abc.xyz), it's probably down.")
 	c.Assert(strings.Replace(buf.String(), "\n", "\\n", -1), check.Matches,
 		``+
 			`.*<Request uri="/">.*`+
@@ -114,6 +156,7 @@ func (s *S) TestShouldReturnErrorWhenServerIsDown(c *check.C) {
 }
 
 func (s *S) TestShouldNotIncludeTheHeaderAuthorizationWhenTheTsuruTokenFileIsMissing(c *check.C) {
+	os.Unsetenv("TSURU_TOKEN")
 	fsystem = &fstest.FileNotFoundFs{}
 	defer func() {
 		fsystem = nil
@@ -140,6 +183,7 @@ func (s *S) TestShouldNotIncludeTheHeaderAuthorizationWhenTheTsuruTokenFileIsMis
 }
 
 func (s *S) TestShouldIncludeTheHeaderAuthorizationWhenTsuruTokenFileExists(c *check.C) {
+	os.Unsetenv("TSURU_TOKEN")
 	fsystem = &fstest.RecordingFs{FileContent: "mytoken"}
 	defer func() {
 		fsystem = nil
@@ -234,4 +278,14 @@ func (s *S) TestShouldSkupValidationIfServerDoesNotReturnSupportedHeader(c *chec
 	_, err = client.Do(request)
 	c.Assert(err, check.IsNil)
 	c.Assert(buf.String(), check.Equals, "")
+}
+
+func (s *S) TestStreamJSONResponse(c *check.C) {
+	reader := bytes.NewBufferString(`{"message":"hello!"}`)
+	var resp http.Response
+	resp.Body = ioutil.NopCloser(reader)
+	var buf bytes.Buffer
+	err := StreamJSONResponse(&buf, &resp)
+	c.Assert(err, check.IsNil)
+	c.Assert(buf.String(), check.Equals, "hello!")
 }

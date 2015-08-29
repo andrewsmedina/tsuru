@@ -61,6 +61,25 @@ tls:key-file
 ``tls:key-file`` is the path to private key file configured to serve the
 domain. This setting is optional, unless ``use-tls`` is true.
 
+server:read-timeout
++++++++++++++++++++
+
+``server:read-timeout`` is the timeout of reading requests in the server. This
+is the maximum duration of any request to the tsuru server.
+
+This is useful to avoid leaking connections, in case clients drop the
+connection before end sending the request. The default value is 0, meaning no
+timeout.
+
+server:write-timeout
+++++++++++++++++++++
+
+``server:write-timeout`` is the timeout of writing responses in the server.
+
+This is useful to avoid leaking connections, in case clients drop the
+connection before reading the response from tsuru. The default value is 0,
+meaning no timeout.
+
 disable-index-page
 ++++++++++++++++++
 
@@ -98,7 +117,7 @@ It will also include a function used for querying configuration values, named
         {{if getConfig "use-tls"}}
         <p>we're safe</p>
         {{else}}
-        <p>we're unsafe</p>
+        <p>we're not safe</p>
         {{end}}
     </body>
 
@@ -324,7 +343,7 @@ The port used in the callback URL during the authorization step. Check docs for
 
 .. _config_queue:
 
-queue configuration
+Queue configuration
 -------------------
 
 tsuru uses a work queue for asynchronous tasks.
@@ -534,15 +553,21 @@ Routers
 As of 0.10.0, all your router configuration should live under entries with the
 format ``routers:<router name>``.
 
-routers:<router name>:type
-++++++++++++++++++++++++++
+routers:<router name>:type (type: hipache, galeb, vulcand)
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
-Indicates the type of this router configuration. Currently only the value
-``hipache`` is supported. tsuru also has an experimental router implementation
-using `Galeb router <http://galeb.io/>`_ which is available using ``galeb`` type
-value.
+Indicates the type of this router configuration. The standard router supported
+by tsuru is `hipache <https://github.com/hipache/hipache>`_. There is also
+experimental support for `galeb <http://galeb.io/>`_ and `vulcand
+<https://docs.vulcand.io/>`_).
 
 Depending on the type, there are some specific configuration options available.
+
+routers:<router name>:domain (type: hipache, galeb, vulcand)
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+The domain of the server running your router. Applications created with
+tsuru will have a address of ``http://<app-name>.<domain>``
 
 routers:<router name>:redis-server (type: hipache)
 ++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -550,17 +575,10 @@ routers:<router name>:redis-server (type: hipache)
 Redis server used by Hipache router. This same server (or a redis slave of it),
 must be configured in your hipache.conf file.
 
-routers:<router name>:domain (type: hipache)
-++++++++++++++++++++++++++++++++++++++++++++
+routers:<router name>:api-url (type: galeb, vulcand)
+++++++++++++++++++++++++++++++++++++++++++++++++++++
 
-The domain of the server running your hipache server. Applications created with
-tsuru will have a address of ``http://<app-name>.<domain>``
-
-
-routers:<router name>:api-url (type: galeb)
-+++++++++++++++++++++++++++++++++++++++++++
-
-The url for the Galeb manager api.
+The URL for the Galeb or vulcand manager API.
 
 routers:<router name>:username (type: galeb)
 ++++++++++++++++++++++++++++++++++++++++++++
@@ -571,12 +589,6 @@ routers:<router name>:password (type: galeb)
 ++++++++++++++++++++++++++++++++++++++++++++
 
 Galeb manager password.
-
-routers:<router name>:domain (type: galeb)
-++++++++++++++++++++++++++++++++++++++++++
-
-The domain of the server running your Galeb server. Applications created with
-tsuru will have a address of ``http://<app-name>.<domain>``
 
 routers:<router name>:environment (type: galeb)
 +++++++++++++++++++++++++++++++++++++++++++++++
@@ -653,6 +665,20 @@ docker:collection
 
 Database collection name used to store containers information.
 
+.. _config_port_allocator:
+
+docker:port-allocator
++++++++++++++++++++++
+
+The choice of port allocator. There are two possible values:
+
+ * ``docker``: trust Docker to allocate ports. Meaning that whenever a
+   container restarts, the port might change (usually, it changes).
+ * ``tsuru``: leverage port allocation to tsuru, so ports mapped to containers
+   never change.
+
+The default value is "docker".
+
 docker:registry
 +++++++++++++++
 
@@ -690,6 +716,30 @@ docker:repository-namespace
 Docker repository namespace to be used for application and platform images. Images
 will be tagged in docker as <docker:repository-namespace>/<platform-name> and
 <docker:repository-namespace>/<app-name>
+
+.. _config_bs:
+
+docker:bs:image
++++++++++++++++
+
+``docker:bs:image`` is the name of the Docker image to be used to create `big
+sibling <https://github.com/tsuru/bs>`_ containers. The default value is
+"tsuru/bs", which represents `the official image hosted at Docker Hub
+<https://registry.hub.docker.com/u/tsuru/bs/>`_, maintained by the tsuru team.
+
+docker:bs:socket
+++++++++++++++++
+
+``docker:bs:socket`` is the path to the Unix socket in the Docker host. This
+should be configured so bs can connect to Docker via socket instead of TCP.
+This is an optional setting, when omitted, bs will talk to the Docker API using
+the TCP endpoint.
+
+docker:bs:syslog-port
++++++++++++++++++++++
+
+``docker:bs:syslog-port`` is the port in the Docker node that will be used by
+the bs container for collecting logs. The default value is 1514.
 
 docker:max-workers
 ++++++++++++++++++
@@ -815,11 +865,6 @@ docker:user
 
 The user tsuru will use to start the container. The value expected for
 basebuilder platforms is ``ubuntu``.
-
-docker:ssh:user
-+++++++++++++++
-
-Deprecated. You should set ``docker:user`` instead.
 
 .. _config_healing:
 
@@ -949,6 +994,11 @@ tsuru uses IaaS configuration to automatically create new docker nodes and
 adding them to your cluster when using ``docker-node-add`` command. See
 :doc:`adding nodes</installing/adding-nodes>` for more details about how to use
 this command.
+
+.. attention::
+
+    You should configure :ref:`queue <config_queue>` to be able to use IaaS.
+
 
 General settings
 ----------------

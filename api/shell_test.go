@@ -6,13 +6,15 @@ package api
 
 import (
 	"fmt"
-	"net/http"
+	"io/ioutil"
 	"net/http/httptest"
+	"net/url"
+	"time"
 
 	"github.com/tsuru/tsuru/app"
-	"github.com/tsuru/tsuru/errors"
-	"github.com/tsuru/tsuru/provision/provisiontest"
-	"github.com/tsuru/tsuru/safe"
+	"github.com/tsuru/tsuru/provision"
+	"github.com/tsuru/tsuru/tsurutest"
+	"golang.org/x/net/websocket"
 	"gopkg.in/check.v1"
 	"gopkg.in/mgo.v2/bson"
 )
@@ -30,17 +32,30 @@ func (s *S) TestAppShellWithAppName(c *check.C) {
 	err = s.provisioner.Provision(&a)
 	c.Assert(err, check.IsNil)
 	defer s.provisioner.Destroy(&a)
-	s.provisioner.AddUnits(&a, 1, nil)
-	url := fmt.Sprintf("/shell?:app=%s&width=140&height=38&term=xterm", a.Name)
-	request, err := http.NewRequest("GET", url, nil)
+	s.provisioner.AddUnits(&a, 1, "web", nil)
+	m := RunServer(true)
+	server := httptest.NewServer(m)
+	defer server.Close()
+	testServerURL, err := url.Parse(server.URL)
 	c.Assert(err, check.IsNil)
-	buf := safe.NewBuffer([]byte("echo teste"))
-	recorder := provisiontest.Hijacker{Conn: &provisiontest.FakeConn{Buf: buf}}
-	err = remoteShellHandler(&recorder, request, s.token)
+	url := fmt.Sprintf("ws://%s/apps/%s/shell?width=140&height=38&term=xterm", testServerURL.Host, a.Name)
+	config, err := websocket.NewConfig(url, "ws://localhost/")
 	c.Assert(err, check.IsNil)
-	unit := s.provisioner.Units(&a)[0]
-	shells := s.provisioner.Shells(unit.Name)
-	c.Assert(shells, check.HasLen, 1)
+	config.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	wsConn, err := websocket.DialConfig(config)
+	c.Assert(err, check.IsNil)
+	defer wsConn.Close()
+	_, err = wsConn.Write([]byte("echo test"))
+	c.Assert(err, check.IsNil)
+	var shells []provision.ShellOptions
+	err = tsurutest.WaitCondition(5*time.Second, func() bool {
+		units, err := s.provisioner.Units(&a)
+		c.Assert(err, check.IsNil)
+		unit := units[0]
+		shells = s.provisioner.Shells(unit.Name)
+		return len(shells) == 1
+	})
+	c.Assert(err, check.IsNil)
 	c.Assert(shells[0].App.GetName(), check.Equals, a.Name)
 	c.Assert(shells[0].Width, check.Equals, 140)
 	c.Assert(shells[0].Height, check.Equals, 38)
@@ -61,31 +76,46 @@ func (s *S) TestAppShellSpecifyUnit(c *check.C) {
 	err = s.provisioner.Provision(&a)
 	c.Assert(err, check.IsNil)
 	defer s.provisioner.Destroy(&a)
-	s.provisioner.AddUnits(&a, 5, nil)
-	unit := s.provisioner.Units(&a)[3]
-	url := fmt.Sprintf("/shell?:app=%s&width=140&height=38&term=xterm&unit=%s", a.Name, unit.Name)
-	request, err := http.NewRequest("GET", url, nil)
+	s.provisioner.AddUnits(&a, 5, "web", nil)
+	units, err := s.provisioner.Units(&a)
 	c.Assert(err, check.IsNil)
-	buf := safe.NewBuffer([]byte("echo teste"))
-	recorder := provisiontest.Hijacker{Conn: &provisiontest.FakeConn{Buf: buf}}
-	err = remoteShellHandler(&recorder, request, s.token)
+	unit := units[3]
+	m := RunServer(true)
+	server := httptest.NewServer(m)
+	defer server.Close()
+	testServerURL, err := url.Parse(server.URL)
 	c.Assert(err, check.IsNil)
-	shells := s.provisioner.Shells(unit.Name)
+	url := fmt.Sprintf("ws://%s/apps/%s/shell?width=140&height=38&term=xterm&unit=%s", testServerURL.Host, a.Name, unit.Name)
+	config, err := websocket.NewConfig(url, "ws://localhost/")
+	c.Assert(err, check.IsNil)
+	config.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	wsConn, err := websocket.DialConfig(config)
+	c.Assert(err, check.IsNil)
+	defer wsConn.Close()
+	_, err = wsConn.Write([]byte("echo test"))
+	c.Assert(err, check.IsNil)
+	var shells []provision.ShellOptions
+	err = tsurutest.WaitCondition(5*time.Second, func() bool {
+		shells = s.provisioner.Shells(unit.Name)
+		return len(shells) == 1
+	})
+	c.Assert(err, check.IsNil)
 	c.Assert(shells, check.HasLen, 1)
 	c.Assert(shells[0].App.GetName(), check.Equals, a.Name)
 	c.Assert(shells[0].Width, check.Equals, 140)
 	c.Assert(shells[0].Height, check.Equals, 38)
 	c.Assert(shells[0].Term, check.Equals, "xterm")
 	c.Assert(shells[0].Unit, check.Equals, unit.Name)
-	for _, u := range s.provisioner.Units(&a) {
+	units, err = s.provisioner.Units(&a)
+	c.Assert(err, check.IsNil)
+	for _, u := range units {
 		if u.Name != unit.Name {
 			c.Check(s.provisioner.Shells(u.Name), check.HasLen, 0)
 		}
 	}
 }
 
-// TODO(fss): drop this in tsr >= 0.12.0
-func (s *S) TestAppShellSpecifyUnitLegacy(c *check.C) {
+func (s *S) TestAppShellUnauthorizedError(c *check.C) {
 	a := app.App{
 		Name:     "someapp",
 		Platform: "zend",
@@ -98,74 +128,65 @@ func (s *S) TestAppShellSpecifyUnitLegacy(c *check.C) {
 	err = s.provisioner.Provision(&a)
 	c.Assert(err, check.IsNil)
 	defer s.provisioner.Destroy(&a)
-	s.provisioner.AddUnits(&a, 5, nil)
-	unit := s.provisioner.Units(&a)[3]
-	url := fmt.Sprintf("/shell?:app=%s&width=140&height=38&term=xterm&container_id=%s", a.Name, unit.Name)
-	request, err := http.NewRequest("GET", url, nil)
+	s.provisioner.AddUnits(&a, 1, "web", nil)
+	m := RunServer(true)
+	server := httptest.NewServer(m)
+	defer server.Close()
+	testServerURL, err := url.Parse(server.URL)
 	c.Assert(err, check.IsNil)
-	buf := safe.NewBuffer([]byte("echo teste"))
-	recorder := provisiontest.Hijacker{Conn: &provisiontest.FakeConn{Buf: buf}}
-	err = remoteShellHandler(&recorder, request, s.token)
+	url := fmt.Sprintf("ws://%s/apps/%s/shell?width=140&height=38&term=xterm", testServerURL.Host, a.Name)
+	config, err := websocket.NewConfig(url, "ws://localhost/")
 	c.Assert(err, check.IsNil)
-	shells := s.provisioner.Shells(unit.Name)
-	c.Assert(shells, check.HasLen, 1)
-	c.Assert(shells[0].App.GetName(), check.Equals, a.Name)
-	c.Assert(shells[0].Width, check.Equals, 140)
-	c.Assert(shells[0].Height, check.Equals, 38)
-	c.Assert(shells[0].Term, check.Equals, "xterm")
-	c.Assert(shells[0].Unit, check.Equals, unit.Name)
-	for _, u := range s.provisioner.Units(&a) {
-		if u.Name != unit.Name {
-			c.Check(s.provisioner.Shells(u.Name), check.HasLen, 0)
+	wsConn, err := websocket.DialConfig(config)
+	c.Assert(err, check.IsNil)
+	defer wsConn.Close()
+	_, err = wsConn.Write([]byte("echo test"))
+	c.Assert(err, check.IsNil)
+	var result string
+	err = tsurutest.WaitCondition(5*time.Second, func() bool {
+		part, err := ioutil.ReadAll(wsConn)
+		if err != nil {
+			return false
 		}
-	}
+		result += string(part)
+		return result == "Error: no token provided or session expired, please login again\n"
+	})
+	c.Assert(err, check.IsNil)
 }
 
-func (s *S) TestAppShellHandlerUnhijackable(c *check.C) {
+func (s *S) TestAppShellGenericError(c *check.C) {
 	a := app.App{
 		Name:     "someapp",
 		Platform: "zend",
 		Teams:    []string{s.team.Name},
 	}
-	err := s.conn.Apps().Insert(a)
-	c.Assert(err, check.IsNil)
-	defer s.conn.Apps().Remove(bson.M{"name": a.Name})
-	defer s.logConn.Logs(a.Name).DropCollection()
-	url := fmt.Sprintf("/shell?:app=%s&width=2&height=2", a.Name)
-	request, err := http.NewRequest("GET", url, nil)
-	c.Assert(err, check.IsNil)
-	recorder := httptest.NewRecorder()
-	err = remoteShellHandler(recorder, request, s.token)
-	c.Assert(err, check.NotNil)
-	e, ok := err.(*errors.HTTP)
-	c.Assert(ok, check.Equals, true)
-	c.Assert(e.Code, check.Equals, http.StatusInternalServerError)
-	c.Assert(e.Message, check.Equals, "cannot hijack connection")
-}
-
-func (s *S) TestAppShellFailToHijack(c *check.C) {
-	a := app.App{
-		Name:     "someapp",
-		Platform: "zend",
-		Teams:    []string{s.team.Name},
-	}
-	err := s.conn.Apps().Insert(a)
-	c.Assert(err, check.IsNil)
-	defer s.conn.Apps().Remove(bson.M{"name": a.Name})
-	defer s.logConn.Logs(a.Name).DropCollection()
-	err = s.provisioner.Provision(&a)
+	err := s.provisioner.Provision(&a)
 	c.Assert(err, check.IsNil)
 	defer s.provisioner.Destroy(&a)
-	s.provisioner.AddUnits(&a, 1, nil)
-	url := fmt.Sprintf("/shell?:app=%s&width=2&height=2", a.Name)
-	request, err := http.NewRequest("GET", url, nil)
+	s.provisioner.AddUnits(&a, 1, "web", nil)
+	m := RunServer(true)
+	server := httptest.NewServer(m)
+	defer server.Close()
+	testServerURL, err := url.Parse(server.URL)
 	c.Assert(err, check.IsNil)
-	recorder := provisiontest.Hijacker{
-		Err: fmt.Errorf("are you going to hijack the connection? seriously?")}
-	err = remoteShellHandler(&recorder, request, s.token)
-	c.Assert(err, check.NotNil)
-	e, ok := err.(*errors.HTTP)
-	c.Assert(ok, check.Equals, true)
-	c.Assert(e.Code, check.Equals, http.StatusInternalServerError)
-	c.Assert(e.Message, check.Equals, recorder.Err.Error())
+	url := fmt.Sprintf("ws://%s/apps/%s/shell?width=140&height=38&term=xterm", testServerURL.Host, a.Name)
+	config, err := websocket.NewConfig(url, "ws://localhost/")
+	c.Assert(err, check.IsNil)
+	config.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	wsConn, err := websocket.DialConfig(config)
+	c.Assert(err, check.IsNil)
+	defer wsConn.Close()
+	_, err = wsConn.Write([]byte("echo test"))
+	c.Assert(err, check.IsNil)
+	var result string
+	err = tsurutest.WaitCondition(5*time.Second, func() bool {
+		part, err := ioutil.ReadAll(wsConn)
+		if err != nil {
+			c.Log(err)
+			return false
+		}
+		result += string(part)
+		return result == "Error: App someapp not found.\n"
+	})
+	c.Assert(err, check.IsNil)
 }

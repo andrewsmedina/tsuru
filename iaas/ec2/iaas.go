@@ -6,14 +6,18 @@ package ec2
 
 import (
 	"fmt"
+	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/tsuru/monsterqueue"
 	"github.com/tsuru/tsuru/iaas"
+	"github.com/tsuru/tsuru/log"
 	"github.com/tsuru/tsuru/queue"
-	"gopkg.in/amz.v2/aws"
-	"gopkg.in/amz.v2/ec2"
 )
 
 const defaultRegion = "us-east-1"
@@ -30,7 +34,7 @@ func newEC2IaaS(name string) iaas.IaaS {
 	return &EC2IaaS{base: iaas.UserDataIaaS{NamedIaaS: iaas.NamedIaaS{BaseIaaSName: "ec2", IaaSName: name}}}
 }
 
-func (i *EC2IaaS) createEC2Handler(region aws.Region) (*ec2.EC2, error) {
+func (i *EC2IaaS) createEC2Handler(regionOrEndpoint string) (*ec2.EC2, error) {
 	keyId, err := i.base.GetConfigString("key-id")
 	if err != nil {
 		return nil, err
@@ -39,8 +43,19 @@ func (i *EC2IaaS) createEC2Handler(region aws.Region) (*ec2.EC2, error) {
 	if err != nil {
 		return nil, err
 	}
-	auth := aws.Auth{AccessKey: keyId, SecretKey: secretKey}
-	return ec2.New(auth, region), nil
+	var region, endpoint string
+	if strings.HasPrefix(regionOrEndpoint, "http") {
+		endpoint = regionOrEndpoint
+		region = defaultRegion
+	} else {
+		region = regionOrEndpoint
+	}
+	config := aws.Config{
+		Credentials: credentials.NewStaticCredentials(keyId, secretKey, ""),
+		Region:      aws.String(region),
+		Endpoint:    aws.String(endpoint),
+	}
+	return ec2.New(&config), nil
 }
 
 func (i *EC2IaaS) waitForDnsName(ec2Inst *ec2.EC2, instance *ec2.Instance) (*ec2.Instance, error) {
@@ -56,13 +71,14 @@ func (i *EC2IaaS) waitForDnsName(ec2Inst *ec2.EC2, instance *ec2.Instance) (*ec2
 	taskName := fmt.Sprintf("ec2-wait-machine-%s", i.base.IaaSName)
 	waitDuration := time.Duration(maxWaitTime) * time.Second
 	job, err := q.EnqueueWait(taskName, monsterqueue.JobParams{
-		"region":    ec2Inst.Region.Name,
-		"machineId": instance.InstanceId,
+		"region":    ec2Inst.Config.Region,
+		"endpoint":  ec2Inst.Config.Endpoint,
+		"machineId": *instance.InstanceId,
 		"timeout":   maxWaitTime,
 	}, waitDuration)
 	if err != nil {
 		if err == monsterqueue.ErrQueueWaitTimeout {
-			return nil, fmt.Errorf("ec2: time out after %v waiting for instance %s to start", waitDuration, instance.InstanceId)
+			return nil, fmt.Errorf("ec2: time out after %v waiting for instance %s to start", waitDuration, *instance.InstanceId)
 		}
 		return nil, err
 	}
@@ -70,7 +86,7 @@ func (i *EC2IaaS) waitForDnsName(ec2Inst *ec2.EC2, instance *ec2.Instance) (*ec2
 	if err != nil {
 		return nil, err
 	}
-	instance.DNSName = result.(string)
+	instance.PublicDnsName = aws.String(result.(string))
 	return instance, nil
 }
 
@@ -95,62 +111,124 @@ Optional params:
 }
 
 func (i *EC2IaaS) DeleteMachine(m *iaas.Machine) error {
-	regionName, ok := m.CreationParams["region"]
-	if !ok {
-		return fmt.Errorf("region creation param required")
+	regionOrEndpoint := getRegionOrEndpoint(m.CreationParams, false)
+	if regionOrEndpoint == "" {
+		return fmt.Errorf("region or endpoint creation param required")
 	}
-	region, ok := aws.Regions[regionName]
-	if !ok {
-		return fmt.Errorf("region %q not found", regionName)
-	}
-	ec2Inst, err := i.createEC2Handler(region)
+	ec2Inst, err := i.createEC2Handler(regionOrEndpoint)
 	if err != nil {
 		return err
 	}
-	_, err = ec2Inst.TerminateInstances([]string{m.Id})
+	input := ec2.TerminateInstancesInput{InstanceIds: []*string{&m.Id}}
+	_, err = ec2Inst.TerminateInstances(&input)
 	return err
 }
 
+type invalidFieldError struct {
+	fieldName    string
+	convertError error
+}
+
+func (err *invalidFieldError) Error() string {
+	return fmt.Sprintf("invalid value for the field %q: %s", err.fieldName, err.convertError)
+}
+
+func (i *EC2IaaS) buildRunInstancesOptions(params map[string]string) (ec2.RunInstancesInput, error) {
+
+	result := ec2.RunInstancesInput{
+		MaxCount: aws.Int64(1),
+		MinCount: aws.Int64(1),
+	}
+	forbiddenFields := []string{
+		"maxcount", "mincount", "dryrun", "blockdevicemappings",
+		"iaminstanceprofile", "monitoring", "networkinterfaces",
+		"placement",
+	}
+	aliases := map[string]string{
+		"image":         "imageid",
+		"type":          "instancetype",
+		"securitygroup": "securitygroups",
+		"ebs-optimized": "ebsoptimized",
+	}
+	refType := reflect.TypeOf(result)
+	refValue := reflect.ValueOf(&result)
+	for key, value := range params {
+		field, ok := refType.FieldByNameFunc(func(name string) bool {
+			lowerName := strings.ToLower(name)
+			for _, field := range forbiddenFields {
+				if lowerName == field {
+					return false
+				}
+			}
+			lowerKey := strings.ToLower(key)
+			if aliased, ok := aliases[lowerKey]; ok {
+				lowerKey = aliased
+			}
+			return lowerName == lowerKey
+		})
+		if !ok {
+			continue
+		}
+		fieldType := field.Type
+		fieldValue := refValue.Elem().FieldByIndex(field.Index)
+		if !fieldValue.IsValid() || !fieldValue.CanSet() {
+			continue
+		}
+		switch fieldType.Kind() {
+		case reflect.Ptr:
+			switch fieldType.Elem().Kind() {
+			case reflect.String:
+				copy := value
+				fieldValue.Set(reflect.ValueOf(&copy))
+			case reflect.Int64:
+				intValue, err := strconv.ParseInt(value, 10, 64)
+				if err != nil {
+					return result, &invalidFieldError{
+						fieldName:    key,
+						convertError: err,
+					}
+				}
+				fieldValue.Set(reflect.ValueOf(&intValue))
+			case reflect.Bool:
+				boolValue, err := strconv.ParseBool(value)
+				if err != nil {
+					return result, &invalidFieldError{
+						fieldName:    key,
+						convertError: err,
+					}
+				}
+				fieldValue.Set(reflect.ValueOf(&boolValue))
+			}
+		case reflect.Slice:
+			parts := strings.Split(value, ",")
+			values := make([]*string, len(parts))
+			for i, part := range parts {
+				values[i] = aws.String(part)
+			}
+			fieldValue.Set(reflect.ValueOf(values))
+		}
+	}
+	return result, nil
+}
+
 func (i *EC2IaaS) CreateMachine(params map[string]string) (*iaas.Machine, error) {
-	if _, ok := params["region"]; !ok {
-		params["region"] = defaultRegion
-	}
-	regionName := params["region"]
-	region, ok := aws.Regions[regionName]
-	if !ok {
-		return nil, fmt.Errorf("region %q not found", regionName)
-	}
-	imageId, ok := params["image"]
-	if !ok {
-		return nil, fmt.Errorf("image param required")
-	}
-	instanceType, ok := params["type"]
-	if !ok {
-		return nil, fmt.Errorf("type param required")
-	}
-	optimized, _ := params["ebs-optimized"]
-	ebsOptimized, _ := strconv.ParseBool(optimized)
+	regionOrEndpoint := getRegionOrEndpoint(params, true)
 	userData, err := i.base.ReadUserData()
 	if err != nil {
 		return nil, err
 	}
-	keyName, _ := params["keyName"]
-	options := ec2.RunInstances{
-		ImageId:      imageId,
-		InstanceType: instanceType,
-		UserData:     []byte(userData),
-		MinCount:     1,
-		MaxCount:     1,
-		KeyName:      keyName,
-		EBSOptimized: ebsOptimized,
+	options, err := i.buildRunInstancesOptions(params)
+	if err != nil {
+		return nil, err
 	}
-	securityGroup, ok := params["securityGroup"]
-	if ok {
-		options.SecurityGroups = []ec2.SecurityGroup{
-			{Name: securityGroup},
-		}
+	options.UserData = aws.String(userData)
+	if options.ImageId == nil || *options.ImageId == "" {
+		return nil, fmt.Errorf("the parameter %q is required", "imageid")
 	}
-	ec2Inst, err := i.createEC2Handler(region)
+	if options.InstanceType == nil || *options.InstanceType == "" {
+		return nil, fmt.Errorf("the parameter %q is required", "instancetype")
+	}
+	ec2Inst, err := i.createEC2Handler(regionOrEndpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -161,15 +239,50 @@ func (i *EC2IaaS) CreateMachine(params map[string]string) (*iaas.Machine, error)
 	if len(resp.Instances) == 0 {
 		return nil, fmt.Errorf("no instance created")
 	}
-	runInst := &resp.Instances[0]
+	runInst := resp.Instances[0]
+	if tags, ok := params["tags"]; ok {
+		var ec2Tags []*ec2.Tag
+		tagList := strings.Split(tags, ",")
+		ec2Tags = make([]*ec2.Tag, 0, len(tagList))
+		for _, tag := range tagList {
+			if strings.Contains(tag, ":") {
+				parts := strings.SplitN(tag, ":", 2)
+				ec2Tags = append(ec2Tags, &ec2.Tag{
+					Key:   aws.String(parts[0]),
+					Value: aws.String(parts[1]),
+				})
+			}
+		}
+		if len(ec2Tags) > 0 {
+			input := ec2.CreateTagsInput{
+				Resources: []*string{runInst.InstanceId},
+				Tags:      ec2Tags,
+			}
+			_, err = ec2Inst.CreateTags(&input)
+			if err != nil {
+				log.Errorf("failed to tag EC2 instance: %s", err)
+			}
+		}
+	}
 	instance, err := i.waitForDnsName(ec2Inst, runInst)
 	if err != nil {
 		return nil, err
 	}
 	machine := iaas.Machine{
-		Id:      instance.InstanceId,
-		Status:  instance.State.Name,
-		Address: instance.DNSName,
+		Id:      *instance.InstanceId,
+		Status:  *instance.State.Name,
+		Address: *instance.PublicDnsName,
 	}
 	return &machine, nil
+}
+
+func getRegionOrEndpoint(params map[string]string, useDefault bool) string {
+	regionOrEndpoint := params["endpoint"]
+	if regionOrEndpoint == "" {
+		regionOrEndpoint = params["region"]
+		if regionOrEndpoint == "" && useDefault {
+			regionOrEndpoint = defaultRegion
+		}
+	}
+	return regionOrEndpoint
 }

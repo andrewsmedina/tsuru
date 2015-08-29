@@ -65,7 +65,7 @@ func deploy(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 		if err != nil {
 			return err
 		}
-		app, err := getApp(appName, user)
+		app, err := getApp(appName, user, r)
 		if err != nil {
 			return err
 		}
@@ -73,6 +73,7 @@ func deploy(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 		userName = t.GetUserName()
 	}
 	writer := io.NewKeepAliveWriter(w, 30*time.Second, "please wait...")
+	defer writer.Stop()
 	err = app.Deploy(app.DeployOptions{
 		App:          instance,
 		Version:      version,
@@ -144,6 +145,10 @@ func deploysList(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	deploys, err := app.ListDeploys(a, s, u, skipInt, limitInt)
 	if err != nil {
 		return err
+	}
+	if len(deploys) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return nil
 	}
 	return json.NewEncoder(w).Encode(deploys)
 }

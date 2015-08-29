@@ -10,11 +10,16 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/fsouza/go-dockerclient/testing"
 	"github.com/tsuru/config"
 	"github.com/tsuru/docker-cluster/cluster"
 	"github.com/tsuru/tsuru/api"
@@ -26,7 +31,11 @@ import (
 	"github.com/tsuru/tsuru/iaas"
 	tsuruIo "github.com/tsuru/tsuru/io"
 	"github.com/tsuru/tsuru/provision"
+	"github.com/tsuru/tsuru/provision/docker/bs"
+	"github.com/tsuru/tsuru/provision/docker/container"
+	"github.com/tsuru/tsuru/provision/docker/healer"
 	"github.com/tsuru/tsuru/provision/provisiontest"
+	"github.com/tsuru/tsuru/queue"
 	"github.com/tsuru/tsuru/quota"
 	"gopkg.in/check.v1"
 	"gopkg.in/mgo.v2"
@@ -43,7 +52,7 @@ func (TestIaaS) CreateMachine(params map[string]string) (*iaas.Machine, error) {
 	m := iaas.Machine{
 		Id:      params["id"],
 		Status:  "running",
-		Address: params["id"] + ".fake.host",
+		Address: "127.0.0.1",
 	}
 	return &m, nil
 }
@@ -57,11 +66,11 @@ func newTestIaaS(string) iaas.IaaS {
 }
 
 type HandlersSuite struct {
-	conn   *db.Storage
-	server *httptest.Server
-	user   *auth.User
-	token  auth.Token
-	team   *auth.Team
+	conn        *db.Storage
+	user        *auth.User
+	token       auth.Token
+	team        *auth.Team
+	clusterSess *mgo.Session
 }
 
 var _ = check.Suite(&HandlersSuite{})
@@ -74,6 +83,8 @@ func (s *HandlersSuite) SetUpSuite(c *check.C) {
 	config.Set("docker:cluster:mongo-url", "127.0.0.1:27017")
 	config.Set("docker:cluster:mongo-database", "docker_provision_handlers_tests_cluster_stor")
 	config.Set("docker:repository-namespace", "tsuru")
+	config.Set("queue:mongo-url", "127.0.0.1:27017")
+	config.Set("queue:mongo-database", "queue_provision_docker_tests_handlers")
 	config.Set("iaas:default", "test-iaas")
 	config.Set("iaas:node-protocol", "http")
 	config.Set("iaas:node-port", 1234)
@@ -82,13 +93,15 @@ func (s *HandlersSuite) SetUpSuite(c *check.C) {
 	var err error
 	s.conn, err = db.Conn()
 	c.Assert(err, check.IsNil)
+	clusterDbUrl, _ := config.GetString("docker:cluster:mongo-url")
+	s.clusterSess, err = mgo.Dial(clusterDbUrl)
+	c.Assert(err, check.IsNil)
 	pools, err := provision.ListPools(nil)
 	c.Assert(err, check.IsNil)
 	for _, pool := range pools {
 		err = provision.RemovePool(pool.Name)
 		c.Assert(err, check.IsNil)
 	}
-	s.server = httptest.NewServer(nil)
 	s.user = &auth.User{Email: "myadmin@arrakis.com", Password: "123456", Quota: quota.Unlimited}
 	nativeScheme := auth.ManagedScheme(native.NativeScheme{})
 	app.AuthScheme = nativeScheme
@@ -102,49 +115,79 @@ func (s *HandlersSuite) SetUpSuite(c *check.C) {
 }
 
 func (s *HandlersSuite) SetUpTest(c *check.C) {
-	err := clearClusterStorage()
+	config.Set("docker:api-timeout", 2)
+	queue.ResetQueue()
+	err := clearClusterStorage(s.clusterSess)
 	c.Assert(err, check.IsNil)
 	mainDockerProvisioner = &dockerProvisioner{}
 	err = mainDockerProvisioner.Initialize()
 	c.Assert(err, check.IsNil)
-	coll := mainDockerProvisioner.collection()
+	coll := mainDockerProvisioner.Collection()
 	defer coll.Close()
 	err = dbtest.ClearAllCollectionsExcept(coll.Database, []string{"users", "tokens", "teams"})
 	c.Assert(err, check.IsNil)
 }
 
 func (s *HandlersSuite) TearDownSuite(c *check.C) {
-	coll := mainDockerProvisioner.collection()
+	s.clusterSess.Close()
+	coll := mainDockerProvisioner.Collection()
 	defer coll.Close()
 	err := dbtest.ClearAllCollections(coll.Database)
 	c.Assert(err, check.IsNil)
 	s.conn.Close()
 }
 
+func (s *HandlersSuite) startFakeDockerNode(c *check.C) (*testing.DockerServer, func()) {
+	pong := make(chan struct{})
+	server, err := testing.NewServer("127.0.0.1:0", nil, func(r *http.Request) {
+		if strings.Contains(r.URL.Path, "ping") {
+			close(pong)
+		}
+	})
+	c.Assert(err, check.IsNil)
+	url, err := url.Parse(server.URL())
+	c.Assert(err, check.IsNil)
+	_, portString, _ := net.SplitHostPort(url.Host)
+	port, _ := strconv.Atoi(portString)
+	config.Set("iaas:node-port", port)
+	return server, func() {
+		<-pong
+		queue.ResetQueue()
+	}
+}
+
 func (s *HandlersSuite) TestAddNodeHandler(c *check.C) {
+	server, waitQueue := s.startFakeDockerNode(c)
+	defer server.Stop()
 	mainDockerProvisioner.cluster, _ = cluster.New(&segregatedScheduler{}, &cluster.MapStorage{})
-	err := provision.AddPool("pool1")
+	opts := provision.AddPoolOptions{Name: "pool1"}
+	err := provision.AddPool(opts)
 	defer provision.RemovePool("pool1")
-	json := fmt.Sprintf(`{"address": "%s", "pool": "pool1"}`, s.server.URL)
+	json := fmt.Sprintf(`{"address": "%s", "pool": "pool1"}`, server.URL())
 	b := bytes.NewBufferString(json)
 	req, err := http.NewRequest("POST", "/docker/node?register=true", b)
 	c.Assert(err, check.IsNil)
 	rec := httptest.NewRecorder()
 	err = addNodeHandler(rec, req, nil)
 	c.Assert(err, check.IsNil)
-	nodes, err := mainDockerProvisioner.getCluster().Nodes()
+	waitQueue()
+	nodes, err := mainDockerProvisioner.Cluster().Nodes()
 	c.Assert(err, check.IsNil)
 	c.Assert(nodes, check.HasLen, 1)
-	c.Assert(nodes[0].Address, check.Equals, s.server.URL)
+	c.Assert(nodes[0].Address, check.Equals, server.URL())
 	c.Assert(nodes[0].Metadata, check.DeepEquals, map[string]string{
 		"pool": "pool1",
 	})
+	c.Assert(nodes[0].CreationStatus, check.Equals, cluster.NodeCreationStatusCreated)
 }
 
 func (s *HandlersSuite) TestAddNodeHandlerCreatingAnIaasMachine(c *check.C) {
+	server, waitQueue := s.startFakeDockerNode(c)
+	defer server.Stop()
 	iaas.RegisterIaasProvider("test-iaas", newTestIaaS)
 	mainDockerProvisioner.cluster, _ = cluster.New(&segregatedScheduler{}, &cluster.MapStorage{})
-	err := provision.AddPool("pool1")
+	opts := provision.AddPoolOptions{Name: "pool1"}
+	err := provision.AddPool(opts)
 	defer provision.RemovePool("pool1")
 	b := bytes.NewBufferString(`{"pool": "pool1", "id": "test1"}`)
 	req, err := http.NewRequest("POST", "/docker/node?register=false", b)
@@ -156,23 +199,33 @@ func (s *HandlersSuite) TestAddNodeHandlerCreatingAnIaasMachine(c *check.C) {
 	err = json.NewDecoder(rec.Body).Decode(&result)
 	c.Assert(err, check.IsNil)
 	c.Assert(result, check.DeepEquals, map[string]string{"description": "my iaas description"})
-	nodes, err := mainDockerProvisioner.getCluster().Nodes()
+	nodes, err := mainDockerProvisioner.Cluster().UnfilteredNodes()
 	c.Assert(err, check.IsNil)
 	c.Assert(nodes, check.HasLen, 1)
-	c.Assert(nodes[0].Address, check.Equals, "http://test1.fake.host:1234")
+	c.Assert(nodes[0].Address, check.Equals, strings.TrimRight(server.URL(), "/"))
+	c.Assert(nodes[0].CreationStatus, check.Equals, cluster.NodeCreationStatusPending)
+	waitQueue()
+	nodes, err = mainDockerProvisioner.Cluster().Nodes()
+	c.Assert(err, check.IsNil)
+	c.Assert(nodes, check.HasLen, 1)
+	c.Assert(nodes[0].Address, check.Equals, strings.TrimRight(server.URL(), "/"))
 	c.Assert(nodes[0].Metadata, check.DeepEquals, map[string]string{
 		"id":      "test1",
 		"pool":    "pool1",
 		"iaas":    "test-iaas",
 		"iaas-id": "test1",
 	})
+	c.Assert(nodes[0].CreationStatus, check.Equals, cluster.NodeCreationStatusCreated)
 }
 
 func (s *HandlersSuite) TestAddNodeHandlerCreatingAnIaasMachineExplicit(c *check.C) {
+	server, waitQueue := s.startFakeDockerNode(c)
+	defer server.Stop()
 	iaas.RegisterIaasProvider("test-iaas", newTestIaaS)
 	iaas.RegisterIaasProvider("another-test-iaas", newTestIaaS)
 	mainDockerProvisioner.cluster, _ = cluster.New(&segregatedScheduler{}, &cluster.MapStorage{})
-	err := provision.AddPool("pool1")
+	opts := provision.AddPoolOptions{Name: "pool1"}
+	err := provision.AddPool(opts)
 	defer provision.RemovePool("pool1")
 	b := bytes.NewBufferString(`{"pool": "pool1", "id": "test1", "iaas": "another-test-iaas"}`)
 	req, err := http.NewRequest("POST", "/docker/node?register=false", b)
@@ -180,10 +233,11 @@ func (s *HandlersSuite) TestAddNodeHandlerCreatingAnIaasMachineExplicit(c *check
 	rec := httptest.NewRecorder()
 	err = addNodeHandler(rec, req, nil)
 	c.Assert(err, check.IsNil)
-	nodes, err := mainDockerProvisioner.getCluster().Nodes()
+	waitQueue()
+	nodes, err := mainDockerProvisioner.Cluster().Nodes()
 	c.Assert(err, check.IsNil)
 	c.Assert(nodes, check.HasLen, 1)
-	c.Assert(nodes[0].Address, check.Equals, "http://test1.fake.host:1234")
+	c.Assert(nodes[0].Address, check.Equals, strings.TrimRight(server.URL(), "/"))
 	c.Assert(nodes[0].Metadata, check.DeepEquals, map[string]string{
 		"id":      "test1",
 		"pool":    "pool1",
@@ -192,27 +246,31 @@ func (s *HandlersSuite) TestAddNodeHandlerCreatingAnIaasMachineExplicit(c *check
 	})
 }
 
-func (s *HandlersSuite) TestAddNodeHandlerWithoutdCluster(c *check.C) {
-	err := provision.AddPool("pool1")
+func (s *HandlersSuite) TestAddNodeHandlerWithoutCluster(c *check.C) {
+	server, waitQueue := s.startFakeDockerNode(c)
+	defer server.Stop()
+	opts := provision.AddPoolOptions{Name: "pool1"}
+	err := provision.AddPool(opts)
 	defer provision.RemovePool("pool1")
 	config.Set("docker:cluster:redis-server", "127.0.0.1:6379")
 	defer config.Unset("docker:cluster:redis-server")
-	b := bytes.NewBufferString(fmt.Sprintf(`{"address": "%s", "pool": "pool1"}`, s.server.URL))
+	b := bytes.NewBufferString(fmt.Sprintf(`{"address": "%s", "pool": "pool1"}`, server.URL()))
 	req, err := http.NewRequest("POST", "/docker/node?register=true", b)
 	c.Assert(err, check.IsNil)
 	rec := httptest.NewRecorder()
 	err = addNodeHandler(rec, req, nil)
 	c.Assert(err, check.IsNil)
-	nodes, err := mainDockerProvisioner.getCluster().Nodes()
+	waitQueue()
+	nodes, err := mainDockerProvisioner.Cluster().Nodes()
 	c.Assert(err, check.IsNil)
 	c.Assert(nodes, check.HasLen, 1)
-	c.Assert(nodes[0].Address, check.Equals, s.server.URL)
+	c.Assert(nodes[0].Address, check.Equals, server.URL())
 	c.Assert(nodes[0].Metadata, check.DeepEquals, map[string]string{
 		"pool": "pool1",
 	})
 }
 
-func (s *HandlersSuite) TestAddNodeHandlerWithoutdAddress(c *check.C) {
+func (s *HandlersSuite) TestAddNodeHandlerWithoutAddress(c *check.C) {
 	config.Set("docker:cluster:redis-server", "127.0.0.1:6379")
 	defer config.Unset("docker:cluster:redis-server")
 	b := bytes.NewBufferString(`{"pool": "pool1"}`)
@@ -266,7 +324,7 @@ func (s *HandlersSuite) TestRemoveNodeHandler(c *check.C) {
 	var err error
 	mainDockerProvisioner.cluster, err = cluster.New(nil, &cluster.MapStorage{})
 	c.Assert(err, check.IsNil)
-	_, err = mainDockerProvisioner.getCluster().Register("host.com:2375", nil)
+	err = mainDockerProvisioner.Cluster().Register(cluster.Node{Address: "host.com:2375"})
 	c.Assert(err, check.IsNil)
 	b := bytes.NewBufferString(`{"address": "host.com:2375"}`)
 	req, err := http.NewRequest("POST", "/node/remove", b)
@@ -274,7 +332,7 @@ func (s *HandlersSuite) TestRemoveNodeHandler(c *check.C) {
 	rec := httptest.NewRecorder()
 	err = removeNodeHandler(rec, req, nil)
 	c.Assert(err, check.IsNil)
-	nodes, err := mainDockerProvisioner.getCluster().Nodes()
+	nodes, err := mainDockerProvisioner.Cluster().Nodes()
 	c.Assert(len(nodes), check.Equals, 0)
 }
 
@@ -284,7 +342,9 @@ func (s *HandlersSuite) TestRemoveNodeHandlerWithoutRemoveIaaS(c *check.C) {
 	c.Assert(err, check.IsNil)
 	mainDockerProvisioner.cluster, err = cluster.New(nil, &cluster.MapStorage{})
 	c.Assert(err, check.IsNil)
-	_, err = mainDockerProvisioner.getCluster().Register(fmt.Sprintf("http://%s:2375", machine.Address), nil)
+	err = mainDockerProvisioner.Cluster().Register(cluster.Node{
+		Address: fmt.Sprintf("http://%s:2375", machine.Address),
+	})
 	c.Assert(err, check.IsNil)
 	b := bytes.NewBufferString(fmt.Sprintf(`{"address": "http://%s:2375", "remove_iaas": "false"}`, machine.Address))
 	req, err := http.NewRequest("POST", "/node/remove", b)
@@ -292,7 +352,7 @@ func (s *HandlersSuite) TestRemoveNodeHandlerWithoutRemoveIaaS(c *check.C) {
 	rec := httptest.NewRecorder()
 	err = removeNodeHandler(rec, req, nil)
 	c.Assert(err, check.IsNil)
-	nodes, err := mainDockerProvisioner.getCluster().Nodes()
+	nodes, err := mainDockerProvisioner.Cluster().Nodes()
 	c.Assert(len(nodes), check.Equals, 0)
 	dbM, err := iaas.FindMachineById(machine.Id)
 	c.Assert(err, check.IsNil)
@@ -305,7 +365,9 @@ func (s *HandlersSuite) TestRemoveNodeHandlerRemoveIaaS(c *check.C) {
 	c.Assert(err, check.IsNil)
 	mainDockerProvisioner.cluster, err = cluster.New(nil, &cluster.MapStorage{})
 	c.Assert(err, check.IsNil)
-	_, err = mainDockerProvisioner.getCluster().Register(fmt.Sprintf("http://%s:2375", machine.Address), nil)
+	err = mainDockerProvisioner.Cluster().Register(cluster.Node{
+		Address: fmt.Sprintf("http://%s:2375", machine.Address),
+	})
 	c.Assert(err, check.IsNil)
 	b := bytes.NewBufferString(fmt.Sprintf(`{"address": "http://%s:2375", "remove_iaas": "true"}`, machine.Address))
 	req, err := http.NewRequest("POST", "/node/remove", b)
@@ -313,10 +375,110 @@ func (s *HandlersSuite) TestRemoveNodeHandlerRemoveIaaS(c *check.C) {
 	rec := httptest.NewRecorder()
 	err = removeNodeHandler(rec, req, nil)
 	c.Assert(err, check.IsNil)
-	nodes, err := mainDockerProvisioner.getCluster().Nodes()
+	nodes, err := mainDockerProvisioner.Cluster().Nodes()
 	c.Assert(len(nodes), check.Equals, 0)
 	_, err = iaas.FindMachineById(machine.Id)
 	c.Assert(err, check.Equals, mgo.ErrNotFound)
+}
+
+func (s *S) TestRemoveNodeHandlerRebalanceContainers(c *check.C) {
+	p, err := s.startMultipleServersCluster()
+	c.Assert(err, check.IsNil)
+	mainDockerProvisioner = p
+	err = s.newFakeImage(p, "tsuru/app-myapp", nil)
+	c.Assert(err, check.IsNil)
+	appInstance := provisiontest.NewFakeApp("myapp", "python", 0)
+	defer p.Destroy(appInstance)
+	p.Provision(appInstance)
+	coll := p.Collection()
+	defer coll.Close()
+	coll.Insert(container.Container{ID: "container-id", AppName: appInstance.GetName(), Version: "container-version", Image: "tsuru/python", ProcessName: "web"})
+	defer coll.RemoveAll(bson.M{"appname": appInstance.GetName()})
+	imageId, err := appCurrentImageName(appInstance.GetName())
+	c.Assert(err, check.IsNil)
+	nodes, err := mainDockerProvisioner.cluster.Nodes()
+	c.Assert(err, check.IsNil)
+	c.Assert(len(nodes), check.Equals, 2)
+	units, err := addContainersWithHost(&changeUnitsPipelineArgs{
+		toHost:      "127.0.0.1",
+		toAdd:       map[string]*containersToAdd{"web": {Quantity: 5}},
+		app:         appInstance,
+		imageId:     imageId,
+		provisioner: p,
+	})
+	c.Assert(err, check.IsNil)
+	appStruct := &app.App{
+		Name:     appInstance.GetName(),
+		Platform: appInstance.GetPlatform(),
+	}
+	err = s.storage.Apps().Insert(appStruct)
+	c.Assert(err, check.IsNil)
+	err = s.storage.Apps().Update(
+		bson.M{"name": appStruct.Name},
+		bson.M{"$set": bson.M{"units": units}},
+	)
+	c.Assert(err, check.IsNil)
+	b := bytes.NewBufferString(fmt.Sprintf(`{"address": "%s"}`, nodes[0].Address))
+	req, err := http.NewRequest("POST", "/node/remove", b)
+	c.Assert(err, check.IsNil)
+	rec := httptest.NewRecorder()
+	err = removeNodeHandler(rec, req, nil)
+	c.Assert(err, check.IsNil)
+	nodes, err = mainDockerProvisioner.Cluster().Nodes()
+	c.Assert(len(nodes), check.Equals, 1)
+	containerList, err := mainDockerProvisioner.listContainersByHost(urlToHost(nodes[0].Address))
+	c.Assert(err, check.IsNil)
+	c.Assert(len(containerList), check.Equals, 5)
+}
+
+func (s *S) TestRemoveNodeHandlerNoRebalanceContainers(c *check.C) {
+	p, err := s.startMultipleServersCluster()
+	c.Assert(err, check.IsNil)
+	mainDockerProvisioner = p
+	err = s.newFakeImage(p, "tsuru/app-myapp", nil)
+	c.Assert(err, check.IsNil)
+	appInstance := provisiontest.NewFakeApp("myapp", "python", 0)
+	defer p.Destroy(appInstance)
+	p.Provision(appInstance)
+	coll := p.Collection()
+	defer coll.Close()
+	coll.Insert(container.Container{ID: "container-id", AppName: appInstance.GetName(), Version: "container-version", Image: "tsuru/python", ProcessName: "web"})
+	defer coll.RemoveAll(bson.M{"appname": appInstance.GetName()})
+	imageId, err := appCurrentImageName(appInstance.GetName())
+	c.Assert(err, check.IsNil)
+	nodes, err := mainDockerProvisioner.cluster.Nodes()
+	c.Assert(err, check.IsNil)
+	c.Assert(len(nodes), check.Equals, 2)
+	units, err := addContainersWithHost(&changeUnitsPipelineArgs{
+		toHost:      "127.0.0.1",
+		toAdd:       map[string]*containersToAdd{"web": {Quantity: 5}},
+		app:         appInstance,
+		imageId:     imageId,
+		provisioner: p,
+	})
+	c.Assert(err, check.IsNil)
+	appStruct := &app.App{
+		Name:     appInstance.GetName(),
+		Platform: appInstance.GetPlatform(),
+	}
+	err = s.storage.Apps().Insert(appStruct)
+	c.Assert(err, check.IsNil)
+	err = s.storage.Apps().Update(
+		bson.M{"name": appStruct.Name},
+		bson.M{"$set": bson.M{"units": units}},
+	)
+	c.Assert(err, check.IsNil)
+	b := bytes.NewBufferString(fmt.Sprintf(`{"address": "%s"}`, nodes[0].Address))
+	req, err := http.NewRequest("POST", "/node/remove?no-rebalance=true", b)
+	c.Assert(err, check.IsNil)
+	rec := httptest.NewRecorder()
+	err = removeNodeHandler(rec, req, nil)
+	c.Assert(err, check.IsNil)
+	nodes, err = mainDockerProvisioner.Cluster().Nodes()
+	c.Assert(len(nodes), check.Equals, 1)
+	containerList, err := mainDockerProvisioner.listContainersByHost(urlToHost(nodes[0].Address))
+	c.Assert(err, check.IsNil)
+	c.Assert(len(containerList), check.Equals, 0)
 }
 
 func (s *HandlersSuite) TestListNodeHandler(c *check.C) {
@@ -327,9 +489,15 @@ func (s *HandlersSuite) TestListNodeHandler(c *check.C) {
 	var err error
 	mainDockerProvisioner.cluster, err = cluster.New(nil, &cluster.MapStorage{})
 	c.Assert(err, check.IsNil)
-	_, err = mainDockerProvisioner.getCluster().Register("host1.com:2375", map[string]string{"pool": "pool1"})
+	err = mainDockerProvisioner.Cluster().Register(cluster.Node{
+		Address:  "host1.com:2375",
+		Metadata: map[string]string{"pool": "pool1"},
+	})
 	c.Assert(err, check.IsNil)
-	_, err = mainDockerProvisioner.getCluster().Register("host2.com:2375", map[string]string{"pool": "pool2", "foo": "bar"})
+	err = mainDockerProvisioner.Cluster().Register(cluster.Node{
+		Address:  "host2.com:2375",
+		Metadata: map[string]string{"pool": "pool2", "foo": "bar"},
+	})
 	c.Assert(err, check.IsNil)
 	req, err := http.NewRequest("GET", "/node/", nil)
 	rec := httptest.NewRecorder()
@@ -346,18 +514,15 @@ func (s *HandlersSuite) TestListNodeHandler(c *check.C) {
 }
 
 func (s *HandlersSuite) TestFixContainerHandler(c *check.C) {
+	queue.ResetQueue()
 	cleanup, server, p := startDocker("9999")
 	defer cleanup()
-	coll := p.collection()
+	coll := p.Collection()
 	defer coll.Close()
-	conn, err := db.Conn()
+	err := s.conn.Apps().Insert(&app.App{Name: "makea"})
 	c.Assert(err, check.IsNil)
-	defer conn.Close()
-	err = conn.Apps().Insert(&app.App{Name: "makea"})
-	c.Assert(err, check.IsNil)
-	defer conn.Apps().RemoveAll(bson.M{"name": "makea"})
 	err = coll.Insert(
-		container{
+		container.Container{
 			ID:       "9930c24f1c4x",
 			AppName:  "makea",
 			Type:     "python",
@@ -376,28 +541,31 @@ func (s *HandlersSuite) TestFixContainerHandler(c *check.C) {
 		cluster.Node{Address: server.URL},
 	)
 	c.Assert(err, check.IsNil)
+	appInstance := provisiontest.NewFakeApp("makea", "python", 0)
+	defer p.Destroy(appInstance)
+	p.Provision(appInstance)
 	request, err := http.NewRequest("POST", "/fix-containers", nil)
 	c.Assert(err, check.IsNil)
 	recorder := httptest.NewRecorder()
 	err = fixContainersHandler(recorder, request, nil)
 	c.Assert(err, check.IsNil)
-	cont, err := p.getContainer("9930c24f1c4x")
+	cont, err := p.GetContainer("9930c24f1c4x")
 	c.Assert(err, check.IsNil)
 	c.Assert(cont.IP, check.Equals, "127.0.0.9")
 	c.Assert(cont.HostPort, check.Equals, "9999")
 }
 
 func (s *HandlersSuite) TestListContainersByHostHandler(c *check.C) {
-	var result []container
+	var result []container.Container
 	var err error
 	mainDockerProvisioner.cluster, err = cluster.New(&segregatedScheduler{}, &cluster.MapStorage{})
 	c.Assert(err, check.IsNil)
-	coll := mainDockerProvisioner.collection()
+	coll := mainDockerProvisioner.Collection()
 	defer coll.Close()
-	err = coll.Insert(container{ID: "blabla", Type: "python", HostAddr: "http://cittavld1182.globoi.com"})
+	err = coll.Insert(container.Container{ID: "blabla", Type: "python", HostAddr: "http://cittavld1182.globoi.com"})
 	c.Assert(err, check.IsNil)
 	defer coll.Remove(bson.M{"id": "blabla"})
-	err = coll.Insert(container{ID: "bleble", Type: "java", HostAddr: "http://cittavld1182.globoi.com"})
+	err = coll.Insert(container.Container{ID: "bleble", Type: "java", HostAddr: "http://cittavld1182.globoi.com"})
 	c.Assert(err, check.IsNil)
 	defer coll.Remove(bson.M{"id": "bleble"})
 	req, err := http.NewRequest("GET", "/node/cittavld1182.globoi.com/containers?:address=http://cittavld1182.globoi.com", nil)
@@ -417,15 +585,15 @@ func (s *HandlersSuite) TestListContainersByHostHandler(c *check.C) {
 }
 
 func (s *HandlersSuite) TestListContainersByAppHandler(c *check.C) {
-	var result []container
+	var result []container.Container
 	var err error
 	mainDockerProvisioner.cluster, err = cluster.New(&segregatedScheduler{}, &cluster.MapStorage{})
-	coll := mainDockerProvisioner.collection()
+	coll := mainDockerProvisioner.Collection()
 	defer coll.Close()
-	err = coll.Insert(container{ID: "blabla", AppName: "appbla", HostAddr: "http://cittavld1182.globoi.com"})
+	err = coll.Insert(container.Container{ID: "blabla", AppName: "appbla", HostAddr: "http://cittavld1182.globoi.com"})
 	c.Assert(err, check.IsNil)
 	defer coll.Remove(bson.M{"id": "blabla"})
-	err = coll.Insert(container{ID: "bleble", AppName: "appbla", HostAddr: "http://cittavld1180.globoi.com"})
+	err = coll.Insert(container.Container{ID: "bleble", AppName: "appbla", HostAddr: "http://cittavld1180.globoi.com"})
 	c.Assert(err, check.IsNil)
 	defer coll.Remove(bson.M{"id": "bleble"})
 	req, err := http.NewRequest("GET", "/node/appbla/containers?:appname=appbla", nil)
@@ -507,7 +675,7 @@ func (s *HandlersSuite) TestMoveContainerHandler(c *check.C) {
 	var result tsuruIo.SimpleJsonMessage
 	err = json.Unmarshal(body, &result)
 	c.Assert(err, check.IsNil)
-	expected := tsuruIo.SimpleJsonMessage{Message: "Error trying to move container: not found\n"}
+	expected := tsuruIo.SimpleJsonMessage{Message: "Error trying to move container: unit not found\n"}
 	c.Assert(result, check.DeepEquals, expected)
 }
 
@@ -515,37 +683,33 @@ func (s *S) TestRebalanceContainersEmptyBodyHandler(c *check.C) {
 	p, err := s.startMultipleServersCluster()
 	c.Assert(err, check.IsNil)
 	mainDockerProvisioner = p
-	defer s.stopMultipleServersCluster(p)
-	err = s.newFakeImage(p, "tsuru/app-myapp")
+	err = s.newFakeImage(p, "tsuru/app-myapp", nil)
 	c.Assert(err, check.IsNil)
 	appInstance := provisiontest.NewFakeApp("myapp", "python", 0)
 	defer p.Destroy(appInstance)
 	p.Provision(appInstance)
-	coll := p.collection()
+	coll := p.Collection()
 	defer coll.Close()
-	coll.Insert(container{ID: "container-id", AppName: appInstance.GetName(), Version: "container-version", Image: "tsuru/python"})
+	coll.Insert(container.Container{ID: "container-id", AppName: appInstance.GetName(), Version: "container-version", Image: "tsuru/python", ProcessName: "web"})
 	defer coll.RemoveAll(bson.M{"appname": appInstance.GetName()})
 	imageId, err := appCurrentImageName(appInstance.GetName())
 	c.Assert(err, check.IsNil)
 	units, err := addContainersWithHost(&changeUnitsPipelineArgs{
 		toHost:      "localhost",
-		unitsToAdd:  5,
+		toAdd:       map[string]*containersToAdd{"web": {Quantity: 5}},
 		app:         appInstance,
 		imageId:     imageId,
 		provisioner: p,
 	})
 	c.Assert(err, check.IsNil)
-	conn, err := db.Conn()
-	c.Assert(err, check.IsNil)
-	defer conn.Close()
+
 	appStruct := &app.App{
 		Name:     appInstance.GetName(),
 		Platform: appInstance.GetPlatform(),
 	}
-	err = conn.Apps().Insert(appStruct)
+	err = s.storage.Apps().Insert(appStruct)
 	c.Assert(err, check.IsNil)
-	defer conn.Apps().Remove(bson.M{"name": appStruct.Name})
-	err = conn.Apps().Update(
+	err = s.storage.Apps().Update(
 		bson.M{"name": appStruct.Name},
 		bson.M{"$set": bson.M{"units": units}},
 	)
@@ -574,36 +738,31 @@ func (s *S) TestRebalanceContainersFilters(c *check.C) {
 	p, err := s.startMultipleServersClusterSeggregated()
 	c.Assert(err, check.IsNil)
 	mainDockerProvisioner = p
-	defer s.stopMultipleServersCluster(p)
-	err = s.newFakeImage(p, "tsuru/app-myapp")
+	err = s.newFakeImage(p, "tsuru/app-myapp", nil)
 	c.Assert(err, check.IsNil)
 	appInstance := provisiontest.NewFakeApp("myapp", "python", 0)
 	defer p.Destroy(appInstance)
 	p.Provision(appInstance)
-	coll := p.collection()
+	coll := p.Collection()
 	defer coll.Close()
 	defer coll.RemoveAll(bson.M{"appname": appInstance.GetName()})
 	imageId, err := appCurrentImageName(appInstance.GetName())
 	c.Assert(err, check.IsNil)
 	units, err := addContainersWithHost(&changeUnitsPipelineArgs{
 		toHost:      "localhost",
-		unitsToAdd:  5,
+		toAdd:       map[string]*containersToAdd{"web": {Quantity: 5}},
 		app:         appInstance,
 		imageId:     imageId,
 		provisioner: p,
 	})
 	c.Assert(err, check.IsNil)
-	conn, err := db.Conn()
-	c.Assert(err, check.IsNil)
-	defer conn.Close()
 	appStruct := &app.App{
 		Name:     appInstance.GetName(),
 		Platform: appInstance.GetPlatform(),
 	}
-	err = conn.Apps().Insert(appStruct)
+	err = s.storage.Apps().Insert(appStruct)
 	c.Assert(err, check.IsNil)
-	defer conn.Apps().Remove(bson.M{"name": appStruct.Name})
-	err = conn.Apps().Update(
+	err = s.storage.Apps().Update(
 		bson.M{"name": appStruct.Name},
 		bson.M{"$set": bson.M{"units": units}},
 	)
@@ -631,37 +790,32 @@ func (s *S) TestRebalanceContainersDryBodyHandler(c *check.C) {
 	p, err := s.startMultipleServersCluster()
 	c.Assert(err, check.IsNil)
 	mainDockerProvisioner = p
-	defer s.stopMultipleServersCluster(p)
-	err = s.newFakeImage(p, "tsuru/app-myapp")
+	err = s.newFakeImage(p, "tsuru/app-myapp", nil)
 	c.Assert(err, check.IsNil)
 	appInstance := provisiontest.NewFakeApp("myapp", "python", 0)
 	defer p.Destroy(appInstance)
 	p.Provision(appInstance)
-	coll := p.collection()
+	coll := p.Collection()
 	defer coll.Close()
-	coll.Insert(container{ID: "container-id", AppName: appInstance.GetName(), Version: "container-version", Image: "tsuru/python"})
+	coll.Insert(container.Container{ID: "container-id", AppName: appInstance.GetName(), Version: "container-version", Image: "tsuru/python", ProcessName: "web"})
 	defer coll.RemoveAll(bson.M{"appname": appInstance.GetName()})
 	imageId, err := appCurrentImageName(appInstance.GetName())
 	c.Assert(err, check.IsNil)
 	units, err := addContainersWithHost(&changeUnitsPipelineArgs{
 		toHost:      "localhost",
-		unitsToAdd:  5,
+		toAdd:       map[string]*containersToAdd{"web": {Quantity: 5}},
 		app:         appInstance,
 		imageId:     imageId,
 		provisioner: p,
 	})
 	c.Assert(err, check.IsNil)
-	conn, err := db.Conn()
-	c.Assert(err, check.IsNil)
-	defer conn.Close()
 	appStruct := &app.App{
 		Name:     appInstance.GetName(),
 		Platform: appInstance.GetPlatform(),
 	}
-	err = conn.Apps().Insert(appStruct)
+	err = s.storage.Apps().Insert(appStruct)
 	c.Assert(err, check.IsNil)
-	defer conn.Apps().Remove(bson.M{"name": appStruct.Name})
-	err = conn.Apps().Update(
+	err = s.storage.Apps().Update(
 		bson.M{"name": appStruct.Name},
 		bson.M{"$set": bson.M{"units": units}},
 	)
@@ -687,13 +841,13 @@ func (s *S) TestRebalanceContainersDryBodyHandler(c *check.C) {
 }
 
 func (s *HandlersSuite) TestHealingHistoryHandler(c *check.C) {
-	evt1, err := newHealingEvent(cluster.Node{Address: "addr1"})
+	evt1, err := healer.NewHealingEvent(cluster.Node{Address: "addr1"})
 	c.Assert(err, check.IsNil)
-	evt1.update(cluster.Node{Address: "addr2"}, nil)
-	evt2, err := newHealingEvent(cluster.Node{Address: "addr3"})
-	evt2.update(cluster.Node{}, errors.New("some error"))
-	evt3, err := newHealingEvent(container{ID: "1234"})
-	evt3.update(container{ID: "9876"}, nil)
+	evt1.Update(cluster.Node{Address: "addr2"}, nil)
+	evt2, err := healer.NewHealingEvent(cluster.Node{Address: "addr3"})
+	evt2.Update(cluster.Node{}, errors.New("some error"))
+	evt3, err := healer.NewHealingEvent(container.Container{ID: "1234"})
+	evt3.Update(container.Container{ID: "9876"}, nil)
 	recorder := httptest.NewRecorder()
 	request, err := http.NewRequest("GET", "/docker/healing", nil)
 	c.Assert(err, check.IsNil)
@@ -702,7 +856,7 @@ func (s *HandlersSuite) TestHealingHistoryHandler(c *check.C) {
 	server.ServeHTTP(recorder, request)
 	c.Assert(recorder.Code, check.Equals, http.StatusOK)
 	body := recorder.Body.Bytes()
-	healings := []healingEvent{}
+	var healings []healer.HealingEvent
 	err = json.Unmarshal(body, &healings)
 	c.Assert(err, check.IsNil)
 	c.Assert(healings, check.HasLen, 3)
@@ -726,13 +880,13 @@ func (s *HandlersSuite) TestHealingHistoryHandler(c *check.C) {
 }
 
 func (s *HandlersSuite) TestHealingHistoryHandlerFilterContainer(c *check.C) {
-	evt1, err := newHealingEvent(cluster.Node{Address: "addr1"})
+	evt1, err := healer.NewHealingEvent(cluster.Node{Address: "addr1"})
 	c.Assert(err, check.IsNil)
-	evt1.update(cluster.Node{Address: "addr2"}, nil)
-	evt2, err := newHealingEvent(cluster.Node{Address: "addr3"})
-	evt2.update(cluster.Node{}, errors.New("some error"))
-	evt3, err := newHealingEvent(container{ID: "1234"})
-	evt3.update(container{ID: "9876"}, nil)
+	evt1.Update(cluster.Node{Address: "addr2"}, nil)
+	evt2, err := healer.NewHealingEvent(cluster.Node{Address: "addr3"})
+	evt2.Update(cluster.Node{}, errors.New("some error"))
+	evt3, err := healer.NewHealingEvent(container.Container{ID: "1234"})
+	evt3.Update(container.Container{ID: "9876"}, nil)
 	recorder := httptest.NewRecorder()
 	request, err := http.NewRequest("GET", "/docker/healing?filter=container", nil)
 	c.Assert(err, check.IsNil)
@@ -741,7 +895,7 @@ func (s *HandlersSuite) TestHealingHistoryHandlerFilterContainer(c *check.C) {
 	server.ServeHTTP(recorder, request)
 	c.Assert(recorder.Code, check.Equals, http.StatusOK)
 	body := recorder.Body.Bytes()
-	healings := []healingEvent{}
+	var healings []healer.HealingEvent
 	err = json.Unmarshal(body, &healings)
 	c.Assert(err, check.IsNil)
 	c.Assert(healings, check.HasLen, 1)
@@ -753,13 +907,13 @@ func (s *HandlersSuite) TestHealingHistoryHandlerFilterContainer(c *check.C) {
 }
 
 func (s *HandlersSuite) TestHealingHistoryHandlerFilterNode(c *check.C) {
-	evt1, err := newHealingEvent(cluster.Node{Address: "addr1"})
+	evt1, err := healer.NewHealingEvent(cluster.Node{Address: "addr1"})
 	c.Assert(err, check.IsNil)
-	evt1.update(cluster.Node{Address: "addr2"}, nil)
-	evt2, err := newHealingEvent(cluster.Node{Address: "addr3"})
-	evt2.update(cluster.Node{}, errors.New("some error"))
-	evt3, err := newHealingEvent(container{ID: "1234"})
-	evt3.update(container{ID: "9876"}, nil)
+	evt1.Update(cluster.Node{Address: "addr2"}, nil)
+	evt2, err := healer.NewHealingEvent(cluster.Node{Address: "addr3"})
+	evt2.Update(cluster.Node{}, errors.New("some error"))
+	evt3, err := healer.NewHealingEvent(container.Container{ID: "1234"})
+	evt3.Update(container.Container{ID: "9876"}, nil)
 	recorder := httptest.NewRecorder()
 	request, err := http.NewRequest("GET", "/docker/healing?filter=node", nil)
 	c.Assert(err, check.IsNil)
@@ -768,7 +922,7 @@ func (s *HandlersSuite) TestHealingHistoryHandlerFilterNode(c *check.C) {
 	server.ServeHTTP(recorder, request)
 	c.Assert(recorder.Code, check.Equals, http.StatusOK)
 	body := recorder.Body.Bytes()
-	healings := []healingEvent{}
+	var healings []healer.HealingEvent
 	err = json.Unmarshal(body, &healings)
 	c.Assert(err, check.IsNil)
 	c.Assert(healings, check.HasLen, 2)
@@ -779,18 +933,21 @@ func (s *HandlersSuite) TestHealingHistoryHandlerFilterNode(c *check.C) {
 }
 
 func (s *HandlersSuite) TestAutoScaleHistoryHandler(c *check.C) {
-	evt1, err := newAutoScaleEvent("poolx")
+	evt1, err := newAutoScaleEvent("poolx", nil)
 	c.Assert(err, check.IsNil)
 	err = evt1.update("add", "reason 1")
 	c.Assert(err, check.IsNil)
-	err = evt1.finish(nil, "my log")
+	err = evt1.finish(nil)
 	c.Assert(err, check.IsNil)
-	evt2, err := newAutoScaleEvent("pooly")
+	evt1.logMsg("my evt1")
+	time.Sleep(100 * time.Millisecond)
+	evt2, err := newAutoScaleEvent("pooly", nil)
 	c.Assert(err, check.IsNil)
 	err = evt2.update("rebalance", "reason 2")
 	c.Assert(err, check.IsNil)
-	err = evt2.finish(errors.New("my error"), "my log 2")
+	err = evt2.finish(errors.New("my error"))
 	c.Assert(err, check.IsNil)
+	evt2.logMsg("my evt2")
 	recorder := httptest.NewRecorder()
 	request, err := http.NewRequest("GET", "/docker/autoscale", nil)
 	c.Assert(err, check.IsNil)
@@ -822,7 +979,8 @@ func (s *HandlersSuite) TestUpdateNodeHandler(c *check.C) {
 			"m2": "v2",
 		}},
 	)
-	err := provision.AddPool("pool1")
+	opts := provision.AddPoolOptions{Name: "pool1"}
+	err := provision.AddPool(opts)
 	defer provision.RemovePool("pool1")
 	json := `{"address": "localhost:1999", "m1": "", "m2": "v9", "m3": "v8"}`
 	b := bytes.NewBufferString(json)
@@ -833,7 +991,7 @@ func (s *HandlersSuite) TestUpdateNodeHandler(c *check.C) {
 	server := api.RunServer(true)
 	server.ServeHTTP(recorder, request)
 	c.Assert(recorder.Code, check.Equals, http.StatusOK)
-	nodes, err := mainDockerProvisioner.getCluster().Nodes()
+	nodes, err := mainDockerProvisioner.Cluster().Nodes()
 	c.Assert(err, check.IsNil)
 	c.Assert(nodes, check.HasLen, 1)
 	c.Assert(nodes[0].Metadata, check.DeepEquals, map[string]string{
@@ -849,7 +1007,8 @@ func (s *HandlersSuite) TestUpdateNodeHandlerNoAddress(c *check.C) {
 			"m2": "v2",
 		}},
 	)
-	err := provision.AddPool("pool1")
+	opts := provision.AddPoolOptions{Name: "pool1"}
+	err := provision.AddPool(opts)
 	defer provision.RemovePool("pool1")
 	json := `{"m1": "", "m2": "v9", "m3": "v8"}`
 	b := bytes.NewBufferString(json)
@@ -862,12 +1021,36 @@ func (s *HandlersSuite) TestUpdateNodeHandlerNoAddress(c *check.C) {
 	c.Assert(recorder.Code, check.Equals, http.StatusBadRequest)
 }
 
+func (s *HandlersSuite) TestUpdateNodeDisableNodeHandler(c *check.C) {
+	mainDockerProvisioner.cluster, _ = cluster.New(&segregatedScheduler{}, &cluster.MapStorage{},
+		cluster.Node{Address: "localhost:1999", CreationStatus: cluster.NodeCreationStatusCreated},
+	)
+	opts := provision.AddPoolOptions{Name: "pool1"}
+	err := provision.AddPool(opts)
+	defer provision.RemovePool("pool1")
+	json := `{"address": "localhost:1999"}`
+	b := bytes.NewBufferString(json)
+	recorder := httptest.NewRecorder()
+	request, err := http.NewRequest("PUT", "/docker/node?disabled=true", b)
+	c.Assert(err, check.IsNil)
+	request.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	server := api.RunServer(true)
+	server.ServeHTTP(recorder, request)
+	c.Assert(recorder.Code, check.Equals, http.StatusOK)
+	nodes, err := mainDockerProvisioner.Cluster().UnfilteredNodes()
+	c.Assert(err, check.IsNil)
+	c.Assert(nodes, check.HasLen, 1)
+	c.Assert(nodes[0].CreationStatus, check.DeepEquals, cluster.NodeCreationStatusDisabled)
+}
+
 func (s *HandlersSuite) TestAutoScaleRunHandler(c *check.C) {
 	mainDockerProvisioner.cluster, _ = cluster.New(&segregatedScheduler{}, &cluster.MapStorage{},
 		cluster.Node{Address: "localhost:1999", Metadata: map[string]string{
 			"pool": "pool1",
 		}},
 	)
+	config.Set("docker:auto-scale:enabled", true)
+	defer config.Unset("docker:auto-scale:enabled")
 	config.Set("docker:auto-scale:group-by-metadata", "pool")
 	config.Set("docker:auto-scale:max-container-count", 2)
 	defer config.Unset("docker:auto-scale:max-container-count")
@@ -882,8 +1065,359 @@ func (s *HandlersSuite) TestAutoScaleRunHandler(c *check.C) {
 	body := recorder.Body.String()
 	parts := strings.Split(body, "\n")
 	c.Assert(parts, check.DeepEquals, []string{
-		`{"Message":"[node autoscale] running scaler *docker.countScaler for \"pool\": \"pool1\"\n"}`,
-		`{"Message":"[node autoscale] nothing to do for \"pool\": \"pool1\"\n"}`,
+		`{"Message":"running scaler *docker.countScaler for \"pool\": \"pool1\"\n"}`,
+		`{"Message":"nothing to do for \"pool\": \"pool1\"\n"}`,
 		``,
 	})
+}
+
+type bsEnvList []bs.Env
+
+func (l bsEnvList) Len() int           { return len(l) }
+func (l bsEnvList) Swap(i, j int)      { l[i], l[j] = l[j], l[i] }
+func (l bsEnvList) Less(i, j int) bool { return l[i].Name < l[j].Name }
+
+type bsPoolEnvsList []bs.PoolEnvs
+
+func (l bsPoolEnvsList) Len() int           { return len(l) }
+func (l bsPoolEnvsList) Swap(i, j int)      { l[i], l[j] = l[j], l[i] }
+func (l bsPoolEnvsList) Less(i, j int) bool { return l[i].Name < l[j].Name }
+
+func (s *HandlersSuite) TestBsEnvSetHandler(c *check.C) {
+	recorder := httptest.NewRecorder()
+	json := `{
+		"image": "ignored",
+		"envs": [
+			{"name": "VAR1", "value": "VALUE1"},
+			{"name": "VAR2", "value": "VALUE2"}
+		],
+		"pools": [
+			{
+				"name": "POOL1",
+				"envs": [
+					{"name": "VAR3", "value": "VALUE3"},
+					{"name": "VAR4", "value": "VALUE4"}
+				]
+			},
+			{
+				"name": "POOL2",
+				"envs": [
+					{"name": "VAR5", "value": "VALUE5"},
+					{"name": "VAR6", "value": "VALUE6"}
+				]
+			}
+		]
+	}`
+	body := bytes.NewBufferString(json)
+	request, err := http.NewRequest("POST", "/docker/bs/env", body)
+	c.Assert(err, check.IsNil)
+	request.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	server := api.RunServer(true)
+	server.ServeHTTP(recorder, request)
+	c.Assert(recorder.Code, check.Equals, http.StatusNoContent)
+	conf, err := bs.LoadConfig()
+	c.Assert(err, check.IsNil)
+	c.Assert(conf.Image, check.Equals, "")
+	sort.Sort(bsEnvList(conf.Envs))
+	c.Assert(conf.Envs, check.DeepEquals, []bs.Env{{Name: "VAR1", Value: "VALUE1"}, {Name: "VAR2", Value: "VALUE2"}})
+	c.Assert(conf.Pools, check.HasLen, 2)
+	sort.Sort(bsPoolEnvsList(conf.Pools))
+	sort.Sort(bsEnvList(conf.Pools[0].Envs))
+	sort.Sort(bsEnvList(conf.Pools[1].Envs))
+	c.Assert(conf.Pools, check.DeepEquals, []bs.PoolEnvs{
+		{Name: "POOL1", Envs: []bs.Env{{Name: "VAR3", Value: "VALUE3"}, {Name: "VAR4", Value: "VALUE4"}}},
+		{Name: "POOL2", Envs: []bs.Env{{Name: "VAR5", Value: "VALUE5"}, {Name: "VAR6", Value: "VALUE6"}}},
+	})
+}
+
+func (s *HandlersSuite) TestBsEnvSetHandlerForbiddenVar(c *check.C) {
+	recorder := httptest.NewRecorder()
+	json := `{
+		"image": "ignored",
+		"envs": [
+			{"name": "TSURU_ENDPOINT", "value": "VAL"}
+		]
+	}`
+	body := bytes.NewBufferString(json)
+	request, err := http.NewRequest("POST", "/docker/bs/env", body)
+	c.Assert(err, check.IsNil)
+	request.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	server := api.RunServer(true)
+	server.ServeHTTP(recorder, request)
+	c.Assert(recorder.Code, check.Equals, http.StatusBadRequest)
+	c.Assert(recorder.Body.String(), check.Equals, "cannot set TSURU_ENDPOINT variable\n")
+	_, err = bs.LoadConfig()
+	c.Assert(err, check.ErrorMatches, "not found")
+}
+
+func (s *HandlersSuite) TestBsEnvSetHandlerUpdateExisting(c *check.C) {
+	err := bs.SaveImage("myimg")
+	c.Assert(err, check.IsNil)
+	envMap := bs.EnvMap{"VAR1": "VAL1", "VAR2": "VAL2"}
+	poolEnvMap := bs.PoolEnvMap{
+		"POOL1": bs.EnvMap{"VAR3": "VAL3", "VAR4": "VAL4"},
+	}
+	err = bs.SaveEnvs(envMap, poolEnvMap)
+	c.Assert(err, check.IsNil)
+	recorder := httptest.NewRecorder()
+	json := `{
+		"image": "ignored",
+		"envs": [
+			{"name": "VAR1", "value": ""},
+			{"name": "VAR3", "value": "VAL3"}
+		],
+		"pools": [
+			{
+				"name": "POOL1",
+				"envs": [
+					{"name": "VAR3", "value": ""}
+				]
+			}
+		]
+	}`
+	body := bytes.NewBufferString(json)
+	request, err := http.NewRequest("POST", "/docker/bs/env", body)
+	c.Assert(err, check.IsNil)
+	request.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	server := api.RunServer(true)
+	server.ServeHTTP(recorder, request)
+	c.Assert(recorder.Code, check.Equals, http.StatusNoContent)
+	conf, err := bs.LoadConfig()
+	c.Assert(err, check.IsNil)
+	c.Assert(conf.Image, check.Equals, "myimg")
+	sort.Sort(bsEnvList(conf.Envs))
+	c.Assert(conf.Envs, check.DeepEquals, []bs.Env{{Name: "VAR2", Value: "VAL2"}, {Name: "VAR3", Value: "VAL3"}})
+	c.Assert(conf.Pools, check.DeepEquals, []bs.PoolEnvs{
+		{Name: "POOL1", Envs: []bs.Env{{Name: "VAR4", Value: "VAL4"}}},
+	})
+}
+
+func (s *HandlersSuite) TestBsConfigGetHandler(c *check.C) {
+	recorder := httptest.NewRecorder()
+	request, err := http.NewRequest("GET", "/docker/bs", nil)
+	c.Assert(err, check.IsNil)
+	request.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	server := api.RunServer(true)
+	server.ServeHTTP(recorder, request)
+	c.Assert(recorder.Code, check.Equals, http.StatusOK)
+	expected := &bs.Config{}
+	var conf bs.Config
+	err = json.Unmarshal(recorder.Body.Bytes(), &conf)
+	c.Assert(err, check.IsNil)
+	c.Assert(conf, check.DeepEquals, *expected)
+	err = bs.SaveImage("myimg")
+	c.Assert(err, check.IsNil)
+	envMap := bs.EnvMap{"VAR1": "VAL1", "VAR2": "VAL2"}
+	poolEnvMap := bs.PoolEnvMap{
+		"POOL1": bs.EnvMap{"VAR3": "VAL3", "VAR4": "VAL4"},
+	}
+	err = bs.SaveEnvs(envMap, poolEnvMap)
+	c.Assert(err, check.IsNil)
+	expected, err = bs.LoadConfig()
+	c.Assert(err, check.IsNil)
+	recorder = httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	c.Assert(recorder.Code, check.Equals, http.StatusOK)
+	err = json.Unmarshal(recorder.Body.Bytes(), &conf)
+	c.Assert(err, check.IsNil)
+	c.Assert(conf, check.DeepEquals, *expected)
+}
+
+func (s *HandlersSuite) TestBsUpgradeHandler(c *check.C) {
+	err := bs.SaveImage("tsuru/bs@sha256:abcef384829283eff")
+	c.Assert(err, check.IsNil)
+	recorder := httptest.NewRecorder()
+	request, err := http.NewRequest("POST", "/docker/bs/upgrade", nil)
+	c.Assert(err, check.IsNil)
+	request.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	server := api.RunServer(true)
+	server.ServeHTTP(recorder, request)
+	c.Assert(recorder.Code, check.Equals, http.StatusNoContent)
+	conf, err := bs.LoadConfig()
+	c.Assert(err, check.IsNil)
+	c.Assert(conf.Image, check.Equals, "")
+}
+
+func (s *HandlersSuite) TestAutoScaleConfigHandler(c *check.C) {
+	config.Set("docker:auto-scale:enabled", true)
+	defer config.Unset("docker:auto-scale:enabled")
+	expected, err := json.Marshal(mainDockerProvisioner.initAutoScaleConfig())
+	c.Assert(err, check.IsNil)
+	recorder := httptest.NewRecorder()
+	request, err := http.NewRequest("GET", "/docker/autoscale/config", nil)
+	c.Assert(err, check.IsNil)
+	request.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	server := api.RunServer(true)
+	server.ServeHTTP(recorder, request)
+	c.Assert(recorder.Code, check.Equals, http.StatusOK)
+	c.Assert(recorder.Body.String(), check.Equals, string(expected)+"\n")
+}
+
+func (s *HandlersSuite) TestAutoScaleListRulesEmpty(c *check.C) {
+	recorder := httptest.NewRecorder()
+	request, err := http.NewRequest("GET", "/docker/autoscale/rules", nil)
+	c.Assert(err, check.IsNil)
+	request.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	server := api.RunServer(true)
+	server.ServeHTTP(recorder, request)
+	c.Assert(recorder.Code, check.Equals, http.StatusOK)
+	var rules []autoScaleRule
+	err = json.Unmarshal(recorder.Body.Bytes(), &rules)
+	c.Assert(err, check.IsNil)
+	c.Assert(rules, check.DeepEquals, []autoScaleRule{
+		{Enabled: true, ScaleDownRatio: 1.333, Error: "invalid rule, either memory information or max container count must be set"},
+	})
+}
+
+func (s *HandlersSuite) TestAutoScaleListRulesWithLegacyConfig(c *check.C) {
+	config.Set("docker:auto-scale:metadata-filter", "mypool")
+	config.Set("docker:auto-scale:max-container-count", 4)
+	config.Set("docker:auto-scale:scale-down-ratio", 1.5)
+	config.Set("docker:auto-scale:prevent-rebalance", true)
+	config.Set("docker:scheduler:max-used-memory", 0.9)
+	defer config.Unset("docker:auto-scale:metadata-filter")
+	defer config.Unset("docker:auto-scale:max-container-count")
+	defer config.Unset("docker:auto-scale:scale-down-ratio")
+	defer config.Unset("docker:auto-scale:prevent-rebalance")
+	defer config.Unset("docker:scheduler:max-used-memory")
+	recorder := httptest.NewRecorder()
+	request, err := http.NewRequest("GET", "/docker/autoscale/rules", nil)
+	c.Assert(err, check.IsNil)
+	request.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	server := api.RunServer(true)
+	server.ServeHTTP(recorder, request)
+	c.Assert(recorder.Code, check.Equals, http.StatusOK)
+	var rules []autoScaleRule
+	err = json.Unmarshal(recorder.Body.Bytes(), &rules)
+	c.Assert(err, check.IsNil)
+	c.Assert(rules, check.DeepEquals, []autoScaleRule{
+		{MetadataFilter: "mypool", Enabled: true, MaxContainerCount: 4, ScaleDownRatio: 1.5, PreventRebalance: true, MaxMemoryRatio: 0.9},
+	})
+}
+
+func (s *HandlersSuite) TestAutoScaleListRulesWithDBConfig(c *check.C) {
+	config.Set("docker:auto-scale:scale-down-ratio", 2.0)
+	defer config.Unset("docker:auto-scale:max-container-count")
+	config.Set("docker:scheduler:total-memory-metadata", "maxmemory")
+	defer config.Unset("docker:scheduler:total-memory-metadata")
+	rules := []autoScaleRule{
+		{MetadataFilter: "", Enabled: true, MaxContainerCount: 10, ScaleDownRatio: 1.2},
+		{MetadataFilter: "pool1", Enabled: true, ScaleDownRatio: 1.1, MaxMemoryRatio: 2.0},
+	}
+	for _, r := range rules {
+		err := r.update()
+		c.Assert(err, check.IsNil)
+	}
+	recorder := httptest.NewRecorder()
+	request, err := http.NewRequest("GET", "/docker/autoscale/rules", nil)
+	c.Assert(err, check.IsNil)
+	request.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	server := api.RunServer(true)
+	server.ServeHTTP(recorder, request)
+	c.Assert(recorder.Code, check.Equals, http.StatusOK)
+	var reqRules []autoScaleRule
+	err = json.Unmarshal(recorder.Body.Bytes(), &reqRules)
+	c.Assert(err, check.IsNil)
+	c.Assert(reqRules, check.DeepEquals, rules)
+}
+
+func (s *HandlersSuite) TestAutoScaleSetRule(c *check.C) {
+	config.Set("docker:scheduler:total-memory-metadata", "maxmemory")
+	defer config.Unset("docker:scheduler:total-memory-metadata")
+	rule := autoScaleRule{MetadataFilter: "pool1", Enabled: true, ScaleDownRatio: 1.1, MaxMemoryRatio: 2.0}
+	data, err := json.Marshal(rule)
+	c.Assert(err, check.IsNil)
+	recorder := httptest.NewRecorder()
+	request, err := http.NewRequest("POST", "/docker/autoscale/rules", bytes.NewBuffer(data))
+	c.Assert(err, check.IsNil)
+	request.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	server := api.RunServer(true)
+	server.ServeHTTP(recorder, request)
+	c.Assert(recorder.Code, check.Equals, http.StatusOK)
+	rules, err := listAutoScaleRules()
+	c.Assert(err, check.IsNil)
+	c.Assert(rules, check.DeepEquals, []autoScaleRule{
+		{Enabled: true, ScaleDownRatio: 1.333, Error: "invalid rule, either memory information or max container count must be set"},
+		rule,
+	})
+}
+
+func (s *HandlersSuite) TestAutoScaleSetRuleInvalidRule(c *check.C) {
+	rule := autoScaleRule{MetadataFilter: "pool1", Enabled: true, ScaleDownRatio: 0.9, MaxMemoryRatio: 2.0}
+	data, err := json.Marshal(rule)
+	c.Assert(err, check.IsNil)
+	recorder := httptest.NewRecorder()
+	request, err := http.NewRequest("POST", "/docker/autoscale/rules", bytes.NewBuffer(data))
+	c.Assert(err, check.IsNil)
+	request.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	server := api.RunServer(true)
+	server.ServeHTTP(recorder, request)
+	c.Assert(recorder.Code, check.Equals, http.StatusInternalServerError)
+	c.Assert(recorder.Body.String(), check.Matches, "(?s).*invalid rule, scale down ratio needs to be greater than 1.0, got 0.9.*")
+}
+
+func (s *HandlersSuite) TestAutoScaleSetRuleExisting(c *check.C) {
+	rule := autoScaleRule{MetadataFilter: "", Enabled: true, ScaleDownRatio: 1.1, MaxContainerCount: 5}
+	err := rule.update()
+	c.Assert(err, check.IsNil)
+	rule.MaxContainerCount = 9
+	data, err := json.Marshal(rule)
+	c.Assert(err, check.IsNil)
+	recorder := httptest.NewRecorder()
+	request, err := http.NewRequest("POST", "/docker/autoscale/rules", bytes.NewBuffer(data))
+	c.Assert(err, check.IsNil)
+	request.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	server := api.RunServer(true)
+	server.ServeHTTP(recorder, request)
+	c.Assert(recorder.Code, check.Equals, http.StatusOK)
+	rules, err := listAutoScaleRules()
+	c.Assert(err, check.IsNil)
+	c.Assert(rules, check.DeepEquals, []autoScaleRule{rule})
+}
+
+func (s *HandlersSuite) TestAutoScaleDeleteRule(c *check.C) {
+	rule := autoScaleRule{MetadataFilter: "", Enabled: true, ScaleDownRatio: 1.1, MaxContainerCount: 5}
+	err := rule.update()
+	c.Assert(err, check.IsNil)
+	recorder := httptest.NewRecorder()
+	request, err := http.NewRequest("DELETE", "/docker/autoscale/rules/", nil)
+	c.Assert(err, check.IsNil)
+	request.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	server := api.RunServer(true)
+	server.ServeHTTP(recorder, request)
+	c.Assert(recorder.Code, check.Equals, http.StatusOK)
+	rules, err := listAutoScaleRules()
+	c.Assert(err, check.IsNil)
+	c.Assert(rules, check.DeepEquals, []autoScaleRule{
+		{Enabled: true, ScaleDownRatio: 1.333, Error: "invalid rule, either memory information or max container count must be set"},
+	})
+}
+
+func (s *HandlersSuite) TestAutoScaleDeleteRuleNonDefault(c *check.C) {
+	rule := autoScaleRule{MetadataFilter: "mypool", Enabled: true, ScaleDownRatio: 1.1, MaxContainerCount: 5}
+	err := rule.update()
+	c.Assert(err, check.IsNil)
+	recorder := httptest.NewRecorder()
+	request, err := http.NewRequest("DELETE", "/docker/autoscale/rules/mypool", nil)
+	c.Assert(err, check.IsNil)
+	request.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	server := api.RunServer(true)
+	server.ServeHTTP(recorder, request)
+	c.Assert(recorder.Code, check.Equals, http.StatusOK)
+	rules, err := listAutoScaleRules()
+	c.Assert(err, check.IsNil)
+	c.Assert(rules, check.DeepEquals, []autoScaleRule{
+		{Enabled: true, ScaleDownRatio: 1.333, Error: "invalid rule, either memory information or max container count must be set"},
+	})
+}
+
+func (s *HandlersSuite) TestAutoScaleDeleteRuleNotFound(c *check.C) {
+	recorder := httptest.NewRecorder()
+	request, err := http.NewRequest("DELETE", "/docker/autoscale/rules/mypool", nil)
+	c.Assert(err, check.IsNil)
+	request.Header.Set("Authorization", "bearer "+s.token.GetValue())
+	server := api.RunServer(true)
+	server.ServeHTTP(recorder, request)
+	c.Assert(recorder.Code, check.Equals, http.StatusNotFound)
+	c.Assert(recorder.Body.String(), check.Equals, "rule not found\n")
 }

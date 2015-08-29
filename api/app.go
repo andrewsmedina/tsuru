@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tsuru/tsuru/api/context"
 	"github.com/tsuru/tsuru/app"
@@ -30,10 +31,15 @@ import (
 	"gopkg.in/mgo.v2/bson"
 )
 
-func getApp(name string, u *auth.User) (app.App, error) {
-	a, err := app.GetByName(name)
-	if err != nil {
-		return app.App{}, &errors.HTTP{Code: http.StatusNotFound, Message: fmt.Sprintf("App %s not found.", name)}
+func getApp(name string, u *auth.User, r *http.Request) (app.App, error) {
+	var err error
+	a := context.GetApp(r)
+	if a == nil {
+		a, err = app.GetByName(name)
+		if err != nil {
+			return app.App{}, &errors.HTTP{Code: http.StatusNotFound, Message: fmt.Sprintf("App %s not found.", name)}
+		}
+		context.SetApp(r, a)
 	}
 	if u == nil || u.IsAdmin() {
 		return *a, nil
@@ -62,13 +68,14 @@ func appDelete(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 		return err
 	}
 	rec.Log(u.Email, "app-delete", "app="+r.URL.Query().Get(":app"))
-	a, err := getApp(r.URL.Query().Get(":app"), u)
+	a, err := getApp(r.URL.Query().Get(":app"), u, r)
 	if err != nil {
 		return err
 	}
-	context.SetPreventUnlock(r)
-	app.Delete(&a)
-	fmt.Fprint(w, "success")
+	keepAliveWriter := tsuruIo.NewKeepAliveWriter(w, 30*time.Second, "")
+	defer keepAliveWriter.Stop()
+	writer := &tsuruIo.SimpleJsonMessageEncoderWriter{Encoder: json.NewEncoder(keepAliveWriter)}
+	app.Delete(&a, writer)
 	return nil
 }
 
@@ -79,15 +86,21 @@ type miniApp struct {
 	Units []provision.Unit `json:"units"`
 	CName []string         `json:"cname"`
 	Ip    string           `json:"ip"`
+	Lock  app.AppLock      `json:"lock"`
 }
 
-func minifyApp(app app.App) miniApp {
+func minifyApp(app app.App) (miniApp, error) {
+	units, err := app.Units()
+	if err != nil {
+		return miniApp{}, err
+	}
 	return miniApp{
 		Name:  app.Name,
-		Units: app.Units(),
+		Units: units,
 		CName: app.CName,
 		Ip:    app.Ip,
-	}
+		Lock:  app.Lock,
+	}, nil
 }
 
 func appList(w http.ResponseWriter, r *http.Request, t auth.Token) error {
@@ -99,6 +112,7 @@ func appList(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	platform := r.URL.Query().Get("platform")
 	teamOwner := r.URL.Query().Get("teamowner")
 	owner := r.URL.Query().Get("owner")
+	locked, _ := strconv.ParseBool(r.URL.Query().Get("locked"))
 	extra := make([]interface{}, 0, 1)
 	filter := &app.Filter{}
 	if name != "" {
@@ -117,6 +131,10 @@ func appList(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 		extra = append(extra, fmt.Sprintf("owner=%s", owner))
 		filter.UserOwner = owner
 	}
+	if locked {
+		extra = append(extra, fmt.Sprintf("locked=%v", locked))
+		filter.Locked = true
+	}
 	rec.Log(u.Email, "app-list", extra...)
 	apps, err := app.List(u, filter)
 	if err != nil {
@@ -129,7 +147,10 @@ func appList(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	w.Header().Set("Content-Type", "application/json")
 	miniApps := make([]miniApp, len(apps))
 	for i, app := range apps {
-		miniApps[i] = minifyApp(app)
+		miniApps[i], err = minifyApp(app)
+		if err != nil {
+			return err
+		}
 	}
 	return json.NewEncoder(w).Encode(miniApps)
 }
@@ -140,7 +161,7 @@ func appInfo(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 		return err
 	}
 	rec.Log(u.Email, "app-info", "app="+r.URL.Query().Get(":app"))
-	app, err := getApp(r.URL.Query().Get(":app"), u)
+	app, err := getApp(r.URL.Query().Get(":app"), u, r)
 	if err != nil {
 		return err
 	}
@@ -220,7 +241,7 @@ func setTeamOwner(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	if err != nil {
 		return err
 	}
-	a, err := getApp(r.URL.Query().Get(":app"), u)
+	a, err := getApp(r.URL.Query().Get(":app"), u, r)
 	if err != nil {
 		return err
 	}
@@ -232,20 +253,14 @@ func setTeamOwner(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 }
 
 func numberOfUnits(r *http.Request) (uint, error) {
-	missingMsg := "You must provide the number of units."
-	if r.Body == nil {
-		return 0, &errors.HTTP{Code: http.StatusBadRequest, Message: missingMsg}
+	unitsStr := r.FormValue("units")
+	if unitsStr == "" {
+		return 0, &errors.HTTP{
+			Code:    http.StatusBadRequest,
+			Message: "You must provide the number of units.",
+		}
 	}
-	defer r.Body.Close()
-	b, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return 0, err
-	}
-	value := string(b)
-	if value == "" {
-		return 0, &errors.HTTP{Code: http.StatusBadRequest, Message: missingMsg}
-	}
-	n, err := strconv.ParseUint(value, 10, 32)
+	n, err := strconv.ParseUint(unitsStr, 10, 32)
 	if err != nil || n == 0 {
 		return 0, &errors.HTTP{
 			Code:    http.StatusBadRequest,
@@ -260,19 +275,20 @@ func addUnits(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	if err != nil {
 		return err
 	}
+	processName := r.FormValue("process")
 	appName := r.URL.Query().Get(":app")
 	u, err := t.User()
 	if err != nil {
 		return err
 	}
 	rec.Log(u.Email, "add-units", "app="+appName, fmt.Sprintf("units=%d", n))
-	app, err := getApp(appName, u)
+	app, err := getApp(appName, u, r)
 	if err != nil {
 		return err
 	}
 	w.Header().Set("Content-Type", "application/json")
 	writer := &tsuruIo.SimpleJsonMessageEncoderWriter{Encoder: json.NewEncoder(w)}
-	err = app.AddUnits(n, writer)
+	err = app.AddUnits(n, processName, writer)
 	if err != nil {
 		writer.Encode(tsuruIo.SimpleJsonMessage{Error: err.Error()})
 		return nil
@@ -289,14 +305,21 @@ func removeUnits(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	if err != nil {
 		return err
 	}
+	processName := r.FormValue("process")
 	appName := r.URL.Query().Get(":app")
 	rec.Log(u.Email, "remove-units", "app="+appName, fmt.Sprintf("units=%d", n))
-	app, err := getApp(appName, u)
+	app, err := getApp(appName, u, r)
 	if err != nil {
 		return err
 	}
-	context.SetPreventUnlock(r)
-	return app.RemoveUnits(uint(n))
+	w.Header().Set("Content-Type", "application/json")
+	writer := &tsuruIo.SimpleJsonMessageEncoderWriter{Encoder: json.NewEncoder(w)}
+	err = app.RemoveUnits(uint(n), processName, writer)
+	if err != nil {
+		writer.Encode(tsuruIo.SimpleJsonMessage{Error: err.Error()})
+		return nil
+	}
+	return nil
 }
 
 func setUnitStatus(w http.ResponseWriter, r *http.Request, t auth.Token) error {
@@ -321,13 +344,45 @@ func setUnitStatus(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 		return &errors.HTTP{Code: http.StatusNotFound, Message: err.Error()}
 	}
 	err = a.SetUnitStatus(unitName, status)
-	if err == app.ErrUnitNotFound {
+	if err == provision.ErrUnitNotFound {
 		return &errors.HTTP{Code: http.StatusNotFound, Message: err.Error()}
 	}
 	if err == nil {
 		w.WriteHeader(http.StatusOK)
 	}
 	return err
+}
+
+type updateUnitsResponse struct {
+	ID    string
+	Found bool
+}
+
+func setUnitsStatus(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	if t.GetAppName() != app.InternalAppName {
+		return &errors.HTTP{Code: http.StatusForbidden, Message: "this token is not allowed to execute this action"}
+	}
+	defer r.Body.Close()
+	var input []map[string]string
+	err := json.NewDecoder(r.Body).Decode(&input)
+	if err != nil {
+		return &errors.HTTP{Code: http.StatusBadRequest, Message: err.Error()}
+	}
+	units := make(map[string]provision.Status, len(input))
+	for _, unit := range input {
+		units[unit["ID"]] = provision.Status(unit["Status"])
+	}
+	result, err := app.UpdateUnitsStatus(units)
+	if err != nil {
+		return err
+	}
+	resp := make([]updateUnitsResponse, 0, len(result))
+	for unit, found := range result {
+		resp = append(resp, updateUnitsResponse{ID: unit, Found: found})
+	}
+	w.Header().Add("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	return json.NewEncoder(w).Encode(resp)
 }
 
 func grantAppAccess(w http.ResponseWriter, r *http.Request, t auth.Token) error {
@@ -339,7 +394,7 @@ func grantAppAccess(w http.ResponseWriter, r *http.Request, t auth.Token) error 
 	teamName := r.URL.Query().Get(":team")
 	rec.Log(u.Email, "grant-app-access", "app="+appName, "team="+teamName)
 	team := new(auth.Team)
-	app, err := getApp(appName, u)
+	app, err := getApp(appName, u, r)
 	if err != nil {
 		return err
 	}
@@ -400,7 +455,7 @@ func revokeAppAccess(w http.ResponseWriter, r *http.Request, t auth.Token) error
 	teamName := r.URL.Query().Get(":team")
 	rec.Log(u.Email, "revoke-app-access", "app="+appName, "team="+teamName)
 	team := new(auth.Team)
-	app, err := getApp(appName, u)
+	app, err := getApp(appName, u, r)
 	if err != nil {
 		return err
 	}
@@ -455,7 +510,7 @@ func runCommand(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	appName := r.URL.Query().Get(":app")
 	once := r.URL.Query().Get("once")
 	rec.Log(u.Email, "run-command", "app="+appName, "command="+string(c))
-	app, err := getApp(appName, u)
+	app, err := getApp(appName, u, r)
 	if err != nil {
 		return err
 	}
@@ -487,7 +542,7 @@ func getEnv(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 		}
 		rec.Log(u.Email, "get-env", "app="+appName, fmt.Sprintf("envs=%s", variables))
 	}
-	app, err := getApp(appName, u)
+	app, err := getApp(appName, u, r)
 	if err != nil {
 		return err
 	}
@@ -543,7 +598,7 @@ func setEnv(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	extra := fmt.Sprintf("private=%t", !isPublicEnv)
 	appName := r.URL.Query().Get(":app")
 	rec.Log(u.Email, "set-env", "app="+appName, variables, extra)
-	app, err := getApp(appName, u)
+	app, err := getApp(appName, u, r)
 	if err != nil {
 		return err
 	}
@@ -581,7 +636,7 @@ func unsetEnv(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 		return err
 	}
 	rec.Log(u.Email, "unset-env", "app="+appName, fmt.Sprintf("envs=%s", variables))
-	app, err := getApp(appName, u)
+	app, err := getApp(appName, u, r)
 	if err != nil {
 		return err
 	}
@@ -615,7 +670,7 @@ func setCName(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	appName := r.URL.Query().Get(":app")
 	rawCName := strings.Join(v["cname"], ", ")
 	rec.Log(u.Email, "add-cname", "app="+appName, "cname="+rawCName)
-	app, err := getApp(appName, u)
+	app, err := getApp(appName, u, r)
 	if err != nil {
 		return err
 	}
@@ -648,7 +703,7 @@ func unsetCName(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	appName := r.URL.Query().Get(":app")
 	rawCName := strings.Join(v["cname"], ", ")
 	rec.Log(u.Email, "remove-cname", "app="+appName, "cnames="+rawCName)
-	app, err := getApp(appName, u)
+	app, err := getApp(appName, u, r)
 	if err != nil {
 		return err
 	}
@@ -697,7 +752,7 @@ func appLog(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	}
 	rec.Log(u.Email, "app-log", extra...)
 	filterLog := app.Applog{Source: source, Unit: unit}
-	a, err := getApp(appName, u)
+	a, err := getApp(appName, u, r)
 	if err != nil {
 		return err
 	}
@@ -806,6 +861,7 @@ func unbindServiceInstance(w http.ResponseWriter, r *http.Request, t auth.Token)
 }
 
 func restart(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	process := r.URL.Query().Get("process")
 	w.Header().Set("Content-Type", "text")
 	u, err := t.User()
 	if err != nil {
@@ -813,12 +869,12 @@ func restart(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	}
 	appName := r.URL.Query().Get(":app")
 	rec.Log(u.Email, "restart", "app="+appName)
-	instance, err := getApp(appName, u)
+	instance, err := getApp(appName, u, r)
 	if err != nil {
 		return err
 	}
 	writer := &tsuruIo.SimpleJsonMessageEncoderWriter{Encoder: json.NewEncoder(w)}
-	err = instance.Restart(writer)
+	err = instance.Restart(process, writer)
 	if err != nil {
 		writer.Encode(tsuruIo.SimpleJsonMessage{Error: err.Error()})
 		return err
@@ -869,6 +925,19 @@ func platformList(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 }
 
 func swap(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	getApp := func(name string, u *auth.User, r *http.Request) (app.App, error) {
+		a, err := app.GetByName(name)
+		if err != nil {
+			return app.App{}, &errors.HTTP{Code: http.StatusNotFound, Message: fmt.Sprintf("App %s not found.", name)}
+		}
+		if u == nil || u.IsAdmin() {
+			return *a, nil
+		}
+		if !auth.CheckUserAccess(a.Teams, u) {
+			return *a, &errors.HTTP{Code: http.StatusForbidden, Message: "user does not have access to this app"}
+		}
+		return *a, nil
+	}
 	u, err := t.User()
 	if err != nil {
 		return err
@@ -889,14 +958,15 @@ func swap(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 		return err
 	}
 	defer app.ReleaseApplicationLock(app2Name)
-	app1, err := getApp(app1Name, u)
+
+	app1, err := getApp(app1Name, u, r)
 	if err != nil {
 		return err
 	}
 	if !locked1 {
 		return &errors.HTTP{Code: http.StatusConflict, Message: fmt.Sprintf("%s: %s", app1.Name, &app1.Lock)}
 	}
-	app2, err := getApp(app2Name, u)
+	app2, err := getApp(app2Name, u, r)
 	if err != nil {
 		return err
 	}
@@ -911,7 +981,15 @@ func swap(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 				Message: "platforms don't match",
 			}
 		}
-		if len(app1.Units()) != len(app2.Units()) {
+		app1Units, err := app1.Units()
+		if err != nil {
+			return err
+		}
+		app2Units, err := app2.Units()
+		if err != nil {
+			return err
+		}
+		if len(app1Units) != len(app2Units) {
 			return &errors.HTTP{
 				Code:    http.StatusPreconditionFailed,
 				Message: "number of units doesn't match",
@@ -924,32 +1002,34 @@ func swap(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 
 func start(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	w.Header().Set("Content-Type", "text")
+	process := r.URL.Query().Get("process")
 	u, err := t.User()
 	if err != nil {
 		return err
 	}
 	appName := r.URL.Query().Get(":app")
 	rec.Log(u.Email, "start", "app="+appName)
-	app, err := getApp(appName, u)
+	app, err := getApp(appName, u, r)
 	if err != nil {
 		return err
 	}
-	return app.Start(w)
+	return app.Start(w, process)
 }
 
 func stop(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	w.Header().Set("Content-Type", "text")
+	process := r.URL.Query().Get("process")
 	u, err := t.User()
 	if err != nil {
 		return err
 	}
 	appName := r.URL.Query().Get(":app")
 	rec.Log(u.Email, "stop", "app="+appName)
-	app, err := getApp(appName, u)
+	app, err := getApp(appName, u, r)
 	if err != nil {
 		return err
 	}
-	return app.Stop(w)
+	return app.Stop(w, process)
 }
 
 func forceDeleteLock(w http.ResponseWriter, r *http.Request, t auth.Token) error {
@@ -984,7 +1064,7 @@ func registerUnit(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	}
 	err = a.RegisterUnit(hostname, customData)
 	if err != nil {
-		if err == app.ErrUnitNotFound {
+		if err == provision.ErrUnitNotFound {
 			return &errors.HTTP{Code: http.StatusNotFound, Message: err.Error()}
 		}
 		return err
@@ -992,38 +1072,56 @@ func registerUnit(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	return writeEnvVars(w, a)
 }
 
-// TODO(cezarsa): This method only exist to keep tsuru compatible with older
-// platforms. It should be removed in the next major after 0.10.0. Custom data
-// is now handled in unit registration.
-func saveAppCustomData(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	appName := r.URL.Query().Get(":app")
-	var customData map[string]interface{}
-	err := json.NewDecoder(r.Body).Decode(&customData)
+func appChangePool(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	u, err := t.User()
+	if err != nil {
+		return err
+	}
+	a, err := getApp(r.URL.Query().Get(":app"), u, r)
+	if err != nil {
+		return err
+	}
+	defer r.Body.Close()
+	data, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		return &errors.HTTP{
 			Code:    http.StatusBadRequest,
 			Message: fmt.Sprintf("Unable to decode body: %s", err.Error()),
 		}
 	}
-	a, err := app.GetByName(appName)
-	if err != nil {
-		return err
-	}
-	return a.UpdateCustomData(customData)
+	pool := string(data)
+	rec.Log(u.Email, "app-change-pool", "app="+r.URL.Query().Get(":app"), "pool="+pool)
+	return a.ChangePool(pool)
 }
 
-func appChangePool(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	appName := r.URL.Query().Get(":app")
-	poolName, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return &errors.HTTP{
-			Code:    http.StatusBadRequest,
-			Message: fmt.Sprintf("Unable to decode body: %s", err.Error()),
-		}
-	}
-	a, err := app.GetByName(appName)
+func appMetricEnvs(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	u, err := t.User()
 	if err != nil {
 		return err
 	}
-	return a.ChangePool(string(poolName))
+	a, err := getApp(r.URL.Query().Get(":app"), u, r)
+	if err != nil {
+		return err
+	}
+	rec.Log(u.Email, "app-metric-envs", "app="+r.URL.Query().Get(":app"))
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(a.MetricEnvs())
+}
+
+func appRebuildRoutes(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	u, err := t.User()
+	if err != nil {
+		return err
+	}
+	rec.Log(u.Email, "app-rebuild-routes", "app="+r.URL.Query().Get(":app"))
+	app, err := getApp(r.URL.Query().Get(":app"), u, r)
+	if err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	result, err := app.RebuildRoutes()
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(w).Encode(&result)
 }

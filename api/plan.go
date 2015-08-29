@@ -11,6 +11,7 @@ import (
 	"github.com/tsuru/tsuru/app"
 	"github.com/tsuru/tsuru/auth"
 	"github.com/tsuru/tsuru/errors"
+	"github.com/tsuru/tsuru/io"
 	"github.com/tsuru/tsuru/router"
 )
 
@@ -70,4 +71,30 @@ func listRouters(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	return json.NewEncoder(w).Encode(routers)
+}
+
+func changePlan(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	var plan app.Plan
+	err := json.NewDecoder(r.Body).Decode(&plan)
+	if err != nil {
+		return &errors.HTTP{
+			Code:    http.StatusBadRequest,
+			Message: "unable to parse request body",
+		}
+	}
+	user, err := t.User()
+	if err != nil {
+		return err
+	}
+	a, err := getApp(r.URL.Query().Get(":app"), user, r)
+	if err != nil {
+		return err
+	}
+	writer := &io.SimpleJsonMessageEncoderWriter{Encoder: json.NewEncoder(w)}
+	err = a.ChangePlan(plan.Name, writer)
+	if err == app.ErrPlanNotFound {
+		writer.Encode(io.SimpleJsonMessage{Error: err.Error()})
+		return err
+	}
+	return err
 }

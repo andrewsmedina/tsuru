@@ -99,7 +99,7 @@ func (s *cloudstackSuite) TestCreateMachineAsyncFailure(c *check.C) {
 	}
 	_, err = cs.CreateMachine(params)
 	c.Assert(err, check.ErrorMatches, ".*my weird error.*")
-	c.Assert(calls, check.DeepEquals, []string{"deployVirtualMachine", "queryAsyncJobResult"})
+	c.Assert(calls[:2], check.DeepEquals, []string{"deployVirtualMachine", "queryAsyncJobResult"})
 }
 
 func (s *cloudstackSuite) TestCreateMachineValidateParams(c *check.C) {
@@ -279,7 +279,7 @@ func (s *cloudstackSuite) TestCreateMachineTimeout(c *check.C) {
 		w.Header().Set("Content-type", "application/json")
 		if cmd == "queryAsyncJobResult" {
 			status := jobInProgress
-			if len(calls) > 2 {
+			if len(calls) > 4 {
 				status = 1
 			}
 			fmt.Fprintf(w, `{"queryasyncjobresultresponse": {"jobstatus": %d}}`, status)
@@ -328,6 +328,8 @@ func (s *cloudstackSuite) TestCreateMachineTimeout(c *check.C) {
 	queue.ResetQueue()
 	c.Assert(calls, check.DeepEquals, []string{
 		"deployVirtualMachine",
+		"queryAsyncJobResult",
+		"queryAsyncJobResult",
 		"queryAsyncJobResult",
 		"queryAsyncJobResult",
 		"listVirtualMachines",

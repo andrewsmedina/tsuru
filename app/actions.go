@@ -7,6 +7,7 @@ package app
 import (
 	"errors"
 	"io"
+	"io/ioutil"
 
 	"github.com/tsuru/config"
 	"github.com/tsuru/tsuru/action"
@@ -14,9 +15,9 @@ import (
 	"github.com/tsuru/tsuru/auth"
 	"github.com/tsuru/tsuru/db"
 	"github.com/tsuru/tsuru/log"
-	"github.com/tsuru/tsuru/provision"
 	"github.com/tsuru/tsuru/quota"
 	"github.com/tsuru/tsuru/repository"
+	"github.com/tsuru/tsuru/router"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 )
@@ -122,11 +123,9 @@ var exportEnvironmentsAction = action.Action{
 		if err != nil {
 			return nil, err
 		}
-		host, _ := config.GetString("host")
 		envVars := []bind.EnvVar{
 			{Name: "TSURU_APPNAME", Value: app.Name},
 			{Name: "TSURU_APPDIR", Value: defaultAppDir},
-			{Name: "TSURU_HOST", Value: host},
 			{Name: "TSURU_APP_TOKEN", Value: t.GetValue()},
 		}
 		err = app.setEnvsToApp(envVars, false, false, nil)
@@ -140,7 +139,7 @@ var exportEnvironmentsAction = action.Action{
 		AuthScheme.Logout(app.Env["TSURU_APP_TOKEN"].Value)
 		app, err := GetByName(app.Name)
 		if err == nil {
-			vars := []string{"TSURU_HOST", "TSURU_APPNAME", "TSURU_APP_TOKEN"}
+			vars := []string{"TSURU_APPNAME", "TSURU_APPDIR", "TSURU_APP_TOKEN"}
 			app.UnsetEnvs(vars, false, nil)
 		}
 	},
@@ -301,22 +300,170 @@ var provisionAddUnits = action.Action{
 		default:
 			return nil, errors.New("First parameter must be *App.")
 		}
-		var w io.Writer
-		if len(ctx.Params) >= 3 {
-			w, _ = ctx.Params[2].(io.Writer)
-		}
+		w, _ := ctx.Params[2].(io.Writer)
 		n := ctx.Previous.(int)
-		units, err := Provisioner.AddUnits(app, uint(n), w)
+		process := ctx.Params[3].(string)
+		units, err := Provisioner.AddUnits(app, uint(n), process, w)
 		if err != nil {
 			return nil, err
 		}
 		return units, nil
 	},
+	MinParams: 1,
+}
+
+type changePlanPipelineResult struct {
+	changedRouter bool
+	oldPlan       *Plan
+	oldIp         string
+	app           *App
+}
+
+var moveRouterUnits = action.Action{
+	Name: "change-plan-move-router-units",
+	Forward: func(ctx action.FWContext) (action.Result, error) {
+		app, ok := ctx.Params[0].(*App)
+		if !ok {
+			return nil, errors.New("first parameter must be an *App")
+		}
+		oldPlan, ok := ctx.Params[1].(*Plan)
+		if !ok {
+			return nil, errors.New("second parameter must be a *Plan")
+		}
+		newRouter, err := app.GetRouter()
+		if err != nil {
+			return nil, err
+		}
+		oldRouter, err := oldPlan.getRouter()
+		if err != nil {
+			return nil, err
+		}
+		result := changePlanPipelineResult{oldPlan: oldPlan, app: app, oldIp: app.Ip}
+		if newRouter != oldRouter {
+			_, err = app.RebuildRoutes()
+			if err != nil {
+				return nil, err
+			}
+			result.changedRouter = true
+		}
+		return &result, nil
+	},
 	Backward: func(ctx action.BWContext) {
-		units := ctx.FWResult.([]provision.Unit)
-		for _, unit := range units {
-			Provisioner.RemoveUnit(unit)
+		result := ctx.FWResult.(*changePlanPipelineResult)
+		defer func() {
+			result.app.Plan = *result.oldPlan
+		}()
+		if result.changedRouter {
+			app := result.app
+			app.Ip = result.oldIp
+			conn, err := db.Conn()
+			if err != nil {
+				log.Errorf("BACKWARD ABORTED - failed to connect to the database: %s", err)
+				return
+			}
+			defer conn.Close()
+			conn.Apps().Update(bson.M{"name": app.Name}, bson.M{"$set": bson.M{"ip": app.Ip}})
+			routerName, err := result.app.GetRouter()
+			if err != nil {
+				log.Errorf("BACKWARD ABORTED - failed to get app router: %s", err)
+				return
+			}
+			r, err := router.Get(routerName)
+			if err != nil {
+				log.Errorf("BACKWARD ABORTED - failed to retrieve router %q: %s", routerName, err)
+				return
+			}
+			err = r.RemoveBackend(result.app.Name)
+			if err != nil {
+				log.Error(err.Error())
+			}
 		}
 	},
-	MinParams: 1,
+}
+
+var saveApp = action.Action{
+	Name: "change-plan-save-app",
+	Forward: func(ctx action.FWContext) (action.Result, error) {
+		result, ok := ctx.Previous.(*changePlanPipelineResult)
+		if !ok {
+			return nil, errors.New("invalid previous result, should be changePlanPipelineResult")
+		}
+		conn, err := db.Conn()
+		if err != nil {
+			return nil, err
+		}
+		defer conn.Close()
+		update := bson.M{"$set": bson.M{"plan": result.app.Plan}}
+		err = conn.Apps().Update(bson.M{"name": result.app.Name}, update)
+		if err != nil {
+			return nil, err
+		}
+		return result, nil
+	},
+	Backward: func(ctx action.BWContext) {
+		result := ctx.FWResult.(*changePlanPipelineResult)
+		conn, err := db.Conn()
+		if err != nil {
+			log.Errorf("BACKWARD ABORTED - failed to get database connection: %s", err)
+			return
+		}
+		defer conn.Close()
+		update := bson.M{"$set": bson.M{"plan": *result.oldPlan}}
+		err = conn.Apps().Update(bson.M{"name": result.app.Name}, update)
+		if err != nil {
+			log.Error(err.Error())
+		}
+	},
+}
+
+var restartApp = action.Action{
+	Name: "change-plan-restart-app",
+	Forward: func(ctx action.FWContext) (action.Result, error) {
+		w, ok := ctx.Params[2].(io.Writer)
+		if !ok {
+			log.Error("third parameter must be an io.Writer")
+			w = ioutil.Discard
+		}
+		result, ok := ctx.Previous.(*changePlanPipelineResult)
+		if !ok {
+			return nil, errors.New("invalid previous result, should be changePlanPipelineResult")
+		}
+		app := result.app
+		oldPlan := result.oldPlan
+		if app.GetCpuShare() != oldPlan.CpuShare || app.GetMemory() != oldPlan.Memory || app.GetSwap() != oldPlan.Swap {
+			err := app.Restart("", w)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	},
+}
+
+// removeOldBackend never fails because restartApp is not undoable.
+var removeOldBackend = action.Action{
+	Name: "change-plan-remove-old-backend",
+	Forward: func(ctx action.FWContext) (action.Result, error) {
+		result, ok := ctx.Previous.(*changePlanPipelineResult)
+		if !ok {
+			return nil, errors.New("invalid previous result, should be changePlanPipelineResult")
+		}
+		if result.changedRouter {
+			routerName, err := result.oldPlan.getRouter()
+			if err != nil {
+				log.Errorf("[IGNORED ERROR] failed to remove old backend: %s", err)
+				return nil, nil
+			}
+			r, err := router.Get(routerName)
+			if err != nil {
+				log.Errorf("[IGNORED ERROR] failed to remove old backend: %s", err)
+				return nil, nil
+			}
+			err = r.RemoveBackend(result.app.Name)
+			if err != nil {
+				log.Errorf("[IGNORED ERROR] failed to remove old backend: %s", err)
+			}
+		}
+		return result, nil
+	},
 }

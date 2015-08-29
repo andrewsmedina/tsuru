@@ -8,10 +8,12 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
+	"strconv"
 
 	"gopkg.in/mgo.v2/bson"
 
 	"github.com/tsuru/tsuru/auth"
+	terrors "github.com/tsuru/tsuru/errors"
 	"github.com/tsuru/tsuru/provision"
 	"github.com/tsuru/tsuru/rec"
 )
@@ -31,7 +33,7 @@ func listPoolsToUser(w http.ResponseWriter, r *http.Request, t auth.Token) error
 	if err != nil {
 		return err
 	}
-	var poolsByTeam []PoolsByTeam
+	poolsByTeam := []PoolsByTeam{}
 	for _, t := range teams {
 		pools, err := provision.ListPools(bson.M{"teams": t.Name})
 		if err != nil {
@@ -40,8 +42,16 @@ func listPoolsToUser(w http.ResponseWriter, r *http.Request, t auth.Token) error
 		pbt := PoolsByTeam{Team: t.Name, Pools: provision.GetPoolsNames(pools)}
 		poolsByTeam = append(poolsByTeam, pbt)
 	}
+	publicPools, err := provision.ListPools(bson.M{"public": true})
+	if err != nil {
+		return err
+	}
+	p := map[string]interface{}{
+		"pools_by_team": poolsByTeam,
+		"public_pools":  publicPools,
+	}
 	w.Header().Set("Content-Type", "application/json")
-	return json.NewEncoder(w).Encode(poolsByTeam)
+	return json.NewEncoder(w).Encode(p)
 }
 
 func addPoolHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
@@ -49,12 +59,24 @@ func addPoolHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error 
 	if err != nil {
 		return err
 	}
-	var params map[string]string
-	err = json.Unmarshal(b, &params)
+	var p provision.AddPoolOptions
+	err = json.Unmarshal(b, &p)
 	if err != nil {
 		return err
 	}
-	return provision.AddPool(params["pool"])
+	forceAdd, _ := strconv.ParseBool(r.URL.Query().Get("force"))
+	p.Force = forceAdd
+	err = provision.AddPool(p)
+	if err != nil {
+		if err == provision.ErrDefaultPoolAlreadyExists {
+			return &terrors.HTTP{
+				Code:    http.StatusConflict,
+				Message: "Default pool already exists.",
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 func removePoolHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
@@ -79,7 +101,6 @@ func listPoolHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error
 }
 
 type teamsToPoolParams struct {
-	Pool  string   `json:"pool"`
 	Teams []string `json:"teams"`
 }
 
@@ -93,7 +114,8 @@ func addTeamToPoolHandler(w http.ResponseWriter, r *http.Request, t auth.Token) 
 	if err != nil {
 		return err
 	}
-	return provision.AddTeamsToPool(params.Pool, params.Teams)
+	pool := r.URL.Query().Get(":name")
+	return provision.AddTeamsToPool(pool, params.Teams)
 }
 
 func removeTeamToPoolHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
@@ -106,5 +128,37 @@ func removeTeamToPoolHandler(w http.ResponseWriter, r *http.Request, t auth.Toke
 	if err != nil {
 		return err
 	}
-	return provision.RemoveTeamsFromPool(params.Pool, params.Teams)
+	pool := r.URL.Query().Get(":name")
+	return provision.RemoveTeamsFromPool(pool, params.Teams)
+}
+
+func poolUpdateHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	b, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		return err
+	}
+	var params map[string]*bool
+	err = json.Unmarshal(b, &params)
+	if err != nil {
+		return err
+	}
+	query := bson.M{}
+	for k, v := range params {
+		if v != nil {
+			query[k] = *v
+		}
+	}
+	poolName := r.URL.Query().Get(":name")
+	forceDefault, _ := strconv.ParseBool(r.URL.Query().Get("force"))
+	err = provision.PoolUpdate(poolName, query, forceDefault)
+	if err != nil {
+		if err == provision.ErrDefaultPoolAlreadyExists {
+			return &terrors.HTTP{
+				Code:    http.StatusPreconditionFailed,
+				Message: "Default pool already exists.",
+			}
+		}
+		return err
+	}
+	return nil
 }

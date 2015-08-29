@@ -7,6 +7,7 @@ package docker
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sort"
 	"strings"
 	"testing"
@@ -17,15 +18,18 @@ import (
 	"github.com/tsuru/tsuru/app"
 	"github.com/tsuru/tsuru/auth"
 	"github.com/tsuru/tsuru/auth/native"
-	"github.com/tsuru/tsuru/cmd/cmdtest"
 	"github.com/tsuru/tsuru/db"
 	"github.com/tsuru/tsuru/db/dbtest"
 	"github.com/tsuru/tsuru/iaas"
+	"github.com/tsuru/tsuru/log"
 	"github.com/tsuru/tsuru/provision"
+	"github.com/tsuru/tsuru/queue"
 	"github.com/tsuru/tsuru/quota"
 	"github.com/tsuru/tsuru/repository/repositorytest"
 	"github.com/tsuru/tsuru/router/routertest"
+	"github.com/tsuru/tsuru/safe"
 	"github.com/tsuru/tsuru/service"
+	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/check.v1"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
@@ -43,6 +47,7 @@ type S struct {
 	port           string
 	sshUser        string
 	server         *dtesting.DockerServer
+	extraServer    *dtesting.DockerServer
 	targetRecover  []string
 	storage        *db.Storage
 	oldProvisioner provision.Provisioner
@@ -50,6 +55,8 @@ type S struct {
 	user           *auth.User
 	token          auth.Token
 	team           *auth.Team
+	clusterSess    *mgo.Session
+	logBuf         *safe.Buffer
 }
 
 var _ = check.Suite(&S{})
@@ -59,33 +66,40 @@ func (s *S) SetUpSuite(c *check.C) {
 	s.imageCollName = "docker_image"
 	s.repoNamespace = "tsuru"
 	s.sshUser = "root"
-	config.Set("database:url", "127.0.0.1:27017")
+	s.port = "8888"
+	config.Set("database:url", "127.0.0.1:27017?maxPoolSize=100")
 	config.Set("database:name", "docker_provision_tests_s")
 	config.Set("docker:repository-namespace", s.repoNamespace)
 	config.Set("docker:router", "fake")
 	config.Set("docker:collection", s.collName)
 	config.Set("docker:deploy-cmd", "/var/lib/tsuru/deploy")
 	config.Set("docker:run-cmd:bin", "/usr/local/bin/circusd /etc/circus/circus.ini")
-	config.Set("docker:run-cmd:port", "8888")
+	config.Set("docker:run-cmd:port", s.port)
 	config.Set("docker:user", s.sshUser)
 	config.Set("docker:cluster:mongo-url", "127.0.0.1:27017")
 	config.Set("docker:cluster:mongo-database", "docker_provision_tests_cluster_stor")
+	config.Set("queue:mongo-url", "127.0.0.1:27017")
+	config.Set("queue:mongo-database", "queue_provision_docker_tests")
+	config.Set("queue:mongo-polling-interval", 0.01)
 	config.Set("routers:fake:type", "fake")
 	config.Set("repo-manager", "fake")
 	config.Set("admin-team", "admin")
+	config.Set("docker:registry-max-try", 1)
+	config.Set("auth:hash-cost", bcrypt.MinCost)
 	s.deployCmd = "/var/lib/tsuru/deploy"
 	s.runBin = "/usr/local/bin/circusd"
 	s.runArgs = "/etc/circus/circus.ini"
-	s.port = "8888"
+	os.Setenv("TSURU_TARGET", "http://localhost")
+	s.oldProvisioner = app.Provisioner
 	var err error
-	s.targetRecover = cmdtest.SetTargetFile(c, []byte("http://localhost"))
 	s.storage, err = db.Conn()
 	c.Assert(err, check.IsNil)
-	s.p = &dockerProvisioner{storage: &cluster.MapStorage{}}
-	err = s.p.Initialize()
+	clusterDbUrl, _ := config.GetString("docker:cluster:mongo-url")
+	s.clusterSess, err = mgo.Dial(clusterDbUrl)
 	c.Assert(err, check.IsNil)
-	s.oldProvisioner = app.Provisioner
-	app.Provisioner = s.p
+	err = dbtest.ClearAllCollections(s.storage.Apps().Database)
+	c.Assert(err, check.IsNil)
+	repositorytest.Reset()
 	s.user = &auth.User{Email: "myadmin@arrakis.com", Password: "123456", Quota: quota.Unlimited}
 	nativeScheme := auth.ManagedScheme(native.NativeScheme{})
 	app.AuthScheme = nativeScheme
@@ -100,66 +114,63 @@ func (s *S) SetUpSuite(c *check.C) {
 }
 
 func (s *S) SetUpTest(c *check.C) {
+	config.Set("docker:api-timeout", 2)
 	iaas.ResetAll()
-	config.Set("docker:registry-max-try", 1)
 	repositorytest.Reset()
-	var err error
-	if s.server != nil {
-		s.server.Stop()
-	}
+	queue.ResetQueue()
+	s.p = &dockerProvisioner{storage: &cluster.MapStorage{}}
+	err := s.p.Initialize()
+	c.Assert(err, check.IsNil)
+	queue.ResetQueue()
+	app.Provisioner = s.p
 	s.server, err = dtesting.NewServer("127.0.0.1:0", nil, nil)
 	c.Assert(err, check.IsNil)
-	s.p.cluster, err = cluster.New(nil, &cluster.MapStorage{},
-		cluster.Node{Address: s.server.URL(), Metadata: map[string]string{"pool": "test-fallback"}},
+	s.p.cluster, err = cluster.New(nil, s.p.storage,
+		cluster.Node{Address: s.server.URL(), Metadata: map[string]string{"pool": "test-default"}},
 	)
 	c.Assert(err, check.IsNil)
 	mainDockerProvisioner = s.p
-	coll := s.p.collection()
-	defer coll.Close()
-	err = dbtest.ClearAllCollectionsExcept(coll.Database, []string{"users", "tokens", "teams"})
+	err = dbtest.ClearAllCollectionsExcept(s.storage.Apps().Database, []string{"users", "tokens", "teams"})
 	c.Assert(err, check.IsNil)
-	err = clearClusterStorage()
+	err = clearClusterStorage(s.clusterSess)
 	c.Assert(err, check.IsNil)
 	routertest.FakeRouter.Reset()
-	err = provision.AddPool("test-fallback")
+	opts := provision.AddPoolOptions{Name: "test-default", Default: true}
+	err = provision.AddPool(opts)
 	c.Assert(err, check.IsNil)
+	s.storage.Tokens().Remove(bson.M{"appname": bson.M{"$ne": ""}})
+	s.logBuf = safe.NewBuffer(nil)
+	log.SetLogger(log.NewWriterLogger(s.logBuf, true))
 }
 
 func (s *S) TearDownTest(c *check.C) {
+	log.SetLogger(nil)
 	s.server.Stop()
-}
-
-func clearClusterStorage() error {
-	clusterDbUrl, _ := config.GetString("docker:cluster:mongo-url")
-	clusterDbName, _ := config.GetString("docker:cluster:mongo-database")
-	session, err := mgo.Dial(clusterDbUrl)
-	if err != nil {
-		return err
+	if s.extraServer != nil {
+		s.extraServer.Stop()
+		s.extraServer = nil
 	}
-	defer session.Close()
-	return dbtest.ClearAllCollections(session.DB(clusterDbName))
 }
 
 func (s *S) TearDownSuite(c *check.C) {
-	coll := s.p.collection()
-	defer coll.Close()
-	err := dbtest.ClearAllCollections(coll.Database)
-	c.Assert(err, check.IsNil)
-	cmdtest.RollbackFile(s.targetRecover)
-	dbtest.ClearAllCollections(s.storage.Apps().Database)
+	s.clusterSess.Close()
 	s.storage.Close()
+	os.Unsetenv("TSURU_TARGET")
 	app.Provisioner = s.oldProvisioner
 }
 
-func (s *S) stopMultipleServersCluster(p *dockerProvisioner) {
+func clearClusterStorage(sess *mgo.Session) error {
+	clusterDbName, _ := config.GetString("docker:cluster:mongo-database")
+	return dbtest.ClearAllCollections(sess.DB(clusterDbName))
 }
 
 func (s *S) startMultipleServersCluster() (*dockerProvisioner, error) {
-	otherServer, err := dtesting.NewServer("localhost:0", nil, nil)
+	var err error
+	s.extraServer, err = dtesting.NewServer("localhost:0", nil, nil)
 	if err != nil {
 		return nil, err
 	}
-	otherUrl := strings.Replace(otherServer.URL(), "127.0.0.1", "localhost", 1)
+	otherUrl := strings.Replace(s.extraServer.URL(), "127.0.0.1", "localhost", 1)
 	var p dockerProvisioner
 	err = p.Initialize()
 	if err != nil {
@@ -167,8 +178,8 @@ func (s *S) startMultipleServersCluster() (*dockerProvisioner, error) {
 	}
 	p.storage = &cluster.MapStorage{}
 	p.cluster, err = cluster.New(nil, p.storage,
-		cluster.Node{Address: s.server.URL(), Metadata: map[string]string{"pool": "test-fallback"}},
-		cluster.Node{Address: otherUrl, Metadata: map[string]string{"pool": "test-fallback"}},
+		cluster.Node{Address: s.server.URL(), Metadata: map[string]string{"pool": "test-default"}},
+		cluster.Node{Address: otherUrl, Metadata: map[string]string{"pool": "test-default"}},
 	)
 	if err != nil {
 		return nil, err
@@ -177,11 +188,12 @@ func (s *S) startMultipleServersCluster() (*dockerProvisioner, error) {
 }
 
 func (s *S) startMultipleServersClusterSeggregated() (*dockerProvisioner, error) {
-	otherServer, err := dtesting.NewServer("localhost:0", nil, nil)
+	var err error
+	s.extraServer, err = dtesting.NewServer("localhost:0", nil, nil)
 	if err != nil {
 		return nil, err
 	}
-	otherUrl := strings.Replace(otherServer.URL(), "127.0.0.1", "localhost", 1)
+	otherUrl := strings.Replace(s.extraServer.URL(), "127.0.0.1", "localhost", 1)
 	var p dockerProvisioner
 	err = p.Initialize()
 	if err != nil {
@@ -209,12 +221,8 @@ func (s *S) addServiceInstance(c *check.C, appName string, units []string, fn ht
 	srvc := service.Service{Name: "mysql", Endpoint: map[string]string{"production": ts.URL}}
 	err := srvc.Create()
 	c.Assert(err, check.IsNil)
-	instance := service.ServiceInstance{Name: "my-mysql", ServiceName: "mysql", Teams: []string{}, Units: units}
+	instance := service.ServiceInstance{Name: "my-mysql", ServiceName: "mysql", Teams: []string{}, Units: units, Apps: []string{appName}}
 	err = instance.Create()
-	c.Assert(err, check.IsNil)
-	err = instance.AddApp(appName)
-	c.Assert(err, check.IsNil)
-	err = s.storage.ServiceInstances().Update(bson.M{"name": instance.Name}, instance)
 	c.Assert(err, check.IsNil)
 	return ret
 }

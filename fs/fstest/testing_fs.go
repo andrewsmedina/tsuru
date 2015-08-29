@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/tsuru/tsuru/fs"
 	"github.com/tsuru/tsuru/safe"
@@ -29,8 +30,10 @@ import (
 type FakeFile struct {
 	content string
 	current int64
+	name    string
 	r       *safe.BytesReader
 	f       *os.File
+	modTime time.Time
 }
 
 func (f *FakeFile) reader() *safe.BytesReader {
@@ -70,6 +73,10 @@ func (f *FakeFile) Seek(offset int64, whence int) (int64, error) {
 	return ncurrent, err
 }
 
+func (f *FakeFile) Name() string {
+	return f.name
+}
+
 func (f *FakeFile) Fd() uintptr {
 	if f.f == nil {
 		var err error
@@ -83,17 +90,22 @@ func (f *FakeFile) Fd() uintptr {
 }
 
 func (f *FakeFile) Stat() (fi os.FileInfo, err error) {
-	return
+	return &fileInfo{name: f.Name(), size: int64(len(f.content))}, nil
 }
 
 func (f *FakeFile) Write(p []byte) (n int, err error) {
 	n = len(p)
 	cur := atomic.LoadInt64(&f.current)
-	diff := cur - int64(len(f.content))
+	currentSize := len(f.content)
+	end := int(cur) + n
+	if end > currentSize {
+		end = currentSize
+	}
+	diff := cur - int64(currentSize)
 	if diff > 0 {
 		f.content += strings.Repeat("\x00", int(diff)) + string(p)
 	} else {
-		f.content = f.content[:cur] + string(p)
+		f.content = f.content[:cur] + string(p) + f.content[end:]
 	}
 	return
 }
@@ -158,7 +170,7 @@ func (r *RecordingFs) open(name string, read bool) (fs.File, error) {
 	} else if r.FileContent == "" && read {
 		return nil, syscall.ENOENT
 	}
-	fil := &FakeFile{content: r.FileContent}
+	fil := &FakeFile{content: r.FileContent, name: name}
 	r.files[name] = fil
 	return fil, nil
 }
@@ -247,7 +259,6 @@ func (r *RecordingFs) RemoveAll(path string) error {
 	return nil
 }
 
-// Rename records the action "rename <old> <new>" and returns nil.
 func (r *RecordingFs) Rename(oldname, newname string) error {
 	r.actionsMutex.Lock()
 	r.actions = append(r.actions, "rename "+oldname+" "+newname)
@@ -262,12 +273,19 @@ func (r *RecordingFs) Rename(oldname, newname string) error {
 	return nil
 }
 
-// Stat records the action "stat <name>" and returns nil, nil.
 func (r *RecordingFs) Stat(name string) (os.FileInfo, error) {
 	r.actionsMutex.Lock()
 	defer r.actionsMutex.Unlock()
 	r.actions = append(r.actions, "stat "+name)
-	return nil, nil
+	file, ok := r.files[name]
+	if !ok && r.FileContent == "" {
+		return nil, syscall.ENOENT
+	}
+	info := fileInfo{name: name, size: int64(len(r.FileContent))}
+	if file != nil {
+		info.size = int64(len(file.content))
+	}
+	return &info, nil
 }
 
 // FileNotFoundFs is like RecordingFs, except that it returns ENOENT on Open,

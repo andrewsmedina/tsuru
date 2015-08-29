@@ -13,8 +13,8 @@ import (
 	"github.com/tsuru/config"
 	"github.com/tsuru/docker-cluster/cluster"
 	"github.com/tsuru/tsuru/app"
-	"github.com/tsuru/tsuru/db"
 	"github.com/tsuru/tsuru/provision"
+	"github.com/tsuru/tsuru/provision/docker/container"
 	"gopkg.in/check.v1"
 	"gopkg.in/mgo.v2/bson"
 )
@@ -49,21 +49,18 @@ func (s *S) TestMigrateImages(c *check.C) {
 	c5, err := s.newContainer(&newContainerOpts{Image: "tsuru/app-app2", AppName: "app-app2"}, &p)
 	c.Assert(err, check.IsNil)
 	defer s.removeTestContainer(c5)
-	conn, err := db.Conn()
+	err = s.storage.Apps().Insert(app1, app2, app3)
 	c.Assert(err, check.IsNil)
-	defer conn.Close()
-	conn.Apps().Insert(app1, app2, app3)
-	defer conn.Apps().RemoveAll(bson.M{"name": bson.M{"$in": []string{app1.Name, app2.Name, app3.Name}}})
 	mainDockerProvisioner = &p
 	err = MigrateImages()
 	c.Assert(err, check.IsNil)
-	contApp1, err := p.listContainersBy(bson.M{"appname": app1.Name, "image": "tsuru/app-app1"})
+	contApp1, err := p.ListContainers(bson.M{"appname": app1.Name, "image": "tsuru/app-app1"})
 	c.Assert(err, check.IsNil)
 	c.Assert(contApp1, check.HasLen, 3)
-	contApp2, err := p.listContainersBy(bson.M{"appname": app2.Name, "image": "tsuru/app-app-app2"})
+	contApp2, err := p.ListContainers(bson.M{"appname": app2.Name, "image": "tsuru/app-app-app2"})
 	c.Assert(err, check.IsNil)
 	c.Assert(contApp2, check.HasLen, 0)
-	contApp3, err := p.listContainersBy(bson.M{"appname": app3.Name, "image": "tsuru/app-app-app2"})
+	contApp3, err := p.ListContainers(bson.M{"appname": app3.Name, "image": "tsuru/app-app-app2"})
 	c.Assert(err, check.IsNil)
 	c.Assert(contApp3, check.HasLen, 1)
 }
@@ -81,11 +78,8 @@ func (s *S) TestMigrateImagesWithoutImageInStorage(c *check.C) {
 	p.cluster, _ = cluster.New(nil, &cluster.MapStorage{},
 		cluster.Node{Address: server.URL()})
 	app1 := app.App{Name: "app1"}
-	conn, err := db.Conn()
+	err = s.storage.Apps().Insert(app1)
 	c.Assert(err, check.IsNil)
-	defer conn.Close()
-	conn.Apps().Insert(app1)
-	defer conn.Apps().RemoveAll(bson.M{"name": bson.M{"$in": []string{app1.Name}}})
 	mainDockerProvisioner = &p
 	err = MigrateImages()
 	c.Assert(err, check.IsNil)
@@ -112,14 +106,11 @@ func (s *S) TestMigrateImagesWithRegistry(c *check.C) {
 		cluster.Node{Address: server.URL()})
 	app1 := app.App{Name: "app1"}
 	app2 := app.App{Name: "app2"}
-	conn, err := db.Conn()
+	err = s.storage.Apps().Insert(app1, app2)
 	c.Assert(err, check.IsNil)
-	defer conn.Close()
-	conn.Apps().Insert(app1, app2)
-	defer conn.Apps().RemoveAll(bson.M{"name": bson.M{"$in": []string{app1.Name, app2.Name}}})
-	err = s.newFakeImage(&p, "localhost:3030/tsuru/app1")
+	err = s.newFakeImage(&p, "localhost:3030/tsuru/app1", nil)
 	c.Assert(err, check.IsNil)
-	err = s.newFakeImage(&p, "localhost:3030/tsuru/app2")
+	err = s.newFakeImage(&p, "localhost:3030/tsuru/app2", nil)
 	c.Assert(err, check.IsNil)
 	mainDockerProvisioner = &p
 	err = MigrateImages()
@@ -138,51 +129,42 @@ func (s *S) TestMigrateImagesWithRegistry(c *check.C) {
 }
 
 func (s *S) TestUsePlatformImage(c *check.C) {
-	conn, err := db.Conn()
-	c.Assert(err, check.IsNil)
-	defer conn.Close()
 	app1 := &app.App{Name: "app1", Platform: "python", Deploys: 40}
-	err = conn.Apps().Insert(app1)
+	err := s.storage.Apps().Insert(app1)
 	c.Assert(err, check.IsNil)
 	ok := s.p.usePlatformImage(app1)
 	c.Assert(ok, check.Equals, true)
-	defer conn.Apps().Remove(bson.M{"name": "app1"})
 	app2 := &app.App{Name: "app2", Platform: "python", Deploys: 20}
-	err = conn.Apps().Insert(app2)
+	err = s.storage.Apps().Insert(app2)
 	c.Assert(err, check.IsNil)
 	ok = s.p.usePlatformImage(app2)
 	c.Assert(ok, check.Equals, true)
-	defer conn.Apps().Remove(bson.M{"name": "app2"})
 	app3 := &app.App{Name: "app3", Platform: "python", Deploys: 0}
-	err = conn.Apps().Insert(app3)
+	err = s.storage.Apps().Insert(app3)
 	c.Assert(err, check.IsNil)
 	ok = s.p.usePlatformImage(app3)
 	c.Assert(ok, check.Equals, true)
-	defer conn.Apps().Remove(bson.M{"name": "app3"})
 	app4 := &app.App{Name: "app4", Platform: "python", Deploys: 19}
-	err = conn.Apps().Insert(app4)
+	err = s.storage.Apps().Insert(app4)
 	c.Assert(err, check.IsNil)
 	ok = s.p.usePlatformImage(app4)
-	c.Assert(ok, check.Equals, true)
-	defer conn.Apps().Remove(bson.M{"name": "app4"})
+	c.Assert(ok, check.Equals, false)
 	app5 := &app.App{
 		Name:           "app5",
 		Platform:       "python",
 		Deploys:        19,
 		UpdatePlatform: true,
 	}
-	err = conn.Apps().Insert(app5)
+	err = s.storage.Apps().Insert(app5)
 	c.Assert(err, check.IsNil)
 	ok = s.p.usePlatformImage(app5)
 	c.Assert(ok, check.Equals, true)
-	defer conn.Apps().Remove(bson.M{"name": "app5"})
 	app6 := &app.App{Name: "app6", Platform: "python", Deploys: 19}
-	err = conn.Apps().Insert(app6)
+	err = s.storage.Apps().Insert(app6)
 	c.Assert(err, check.IsNil)
-	defer conn.Apps().Remove(bson.M{"name": "app6"})
-	coll := s.p.collection()
+	coll := s.p.Collection()
 	defer coll.Close()
-	err = coll.Insert(container{AppName: app6.Name, Image: "tsuru/app-app6"})
+	err = coll.Insert(container.Container{AppName: app6.Name, Image: "tsuru/app-app6"})
 	c.Assert(err, check.IsNil)
 	ok = s.p.usePlatformImage(app6)
 	c.Assert(ok, check.Equals, false)
@@ -300,7 +282,7 @@ func (s *S) TestDeleteAllAppImageNamesRemovesCustomData(c *check.C) {
 	c.Assert(err, check.IsNil)
 	_, err = listAppImages("myapp")
 	c.Assert(err, check.ErrorMatches, "not found")
-	yamlData, err := getImageTsuruYamlDataWithFallback(imgName, "")
+	yamlData, err := getImageTsuruYamlData(imgName)
 	c.Assert(err, check.IsNil)
 	c.Assert(yamlData, check.DeepEquals, provision.TsuruYamlData{})
 }
@@ -312,53 +294,9 @@ func (s *S) TestDeleteAllAppImageNamesRemovesCustomDataWithoutImages(c *check.C)
 	c.Assert(err, check.IsNil)
 	err = deleteAllAppImageNames("myapp")
 	c.Assert(err, check.ErrorMatches, "not found")
-	yamlData, err := getImageTsuruYamlDataWithFallback(imgName, "")
+	yamlData, err := getImageTsuruYamlData(imgName)
 	c.Assert(err, check.IsNil)
 	c.Assert(yamlData, check.DeepEquals, provision.TsuruYamlData{})
-}
-
-func (s *S) TestGetImageTsuruYamlDataWithFallback(c *check.C) {
-	data1 := map[string]interface{}{
-		"hooks": map[string]interface{}{
-			"restart": map[string]interface{}{
-				"after": []string{"cmd1", "cmd2"},
-			},
-		},
-	}
-	data2 := map[string]interface{}{
-		"hooks": map[string]interface{}{
-			"restart": map[string]interface{}{
-				"after": []string{"cmd3"},
-			},
-		},
-	}
-	a := &app.App{
-		Name:       "mytestapp",
-		CustomData: data1,
-	}
-	conn, err := db.Conn()
-	c.Assert(err, check.IsNil)
-	defer conn.Close()
-	err = conn.Apps().Insert(a)
-	c.Assert(err, check.IsNil)
-	defer conn.Apps().Remove(bson.M{"name": a.Name})
-	yamlData, err := getImageTsuruYamlDataWithFallback("tsuru/some-image", a.Name)
-	c.Assert(err, check.IsNil)
-	expected := provision.TsuruYamlData{
-		Hooks: provision.TsuruYamlHooks{
-			Restart: provision.TsuruYamlRestartHooks{
-				After: []string{"cmd1", "cmd2"},
-			},
-		},
-	}
-	c.Assert(yamlData, check.DeepEquals, expected)
-	// Overriden by image specific custom data
-	err = saveImageCustomData("tsuru/some-image", data2)
-	c.Assert(err, check.IsNil)
-	yamlData, err = getImageTsuruYamlDataWithFallback("tsuru/some-image", a.Name)
-	c.Assert(err, check.IsNil)
-	expected.Hooks.Restart.After = []string{"cmd3"}
-	c.Assert(yamlData, check.DeepEquals, expected)
 }
 
 func (s *S) TestPullAppImageNames(c *check.C) {
@@ -391,7 +329,48 @@ func (s *S) TestPullAppImageNamesRemovesCustomData(c *check.C) {
 	images, err := listAppImages("myapp")
 	c.Assert(err, check.IsNil)
 	c.Assert(images, check.DeepEquals, []string{"tsuru/app-myapp:v2", "tsuru/app-myapp:v3"})
-	yamlData, err := getImageTsuruYamlDataWithFallback(img1Name, "")
+	yamlData, err := getImageTsuruYamlData(img1Name)
 	c.Assert(err, check.IsNil)
 	c.Assert(yamlData, check.DeepEquals, provision.TsuruYamlData{})
+}
+
+func (s *S) TestGetImageWebProcessName(c *check.C) {
+	img1 := "tsuru/app-myapp:v1"
+	customData1 := map[string]interface{}{
+		"procfile": "web: python myapp.py\nworker: someworker\n",
+	}
+	err := saveImageCustomData(img1, customData1)
+	c.Assert(err, check.IsNil)
+	img2 := "tsuru/app-myapp:v2"
+	customData2 := map[string]interface{}{
+		"procfile": "worker1: python myapp.py\nworker2: someworker\n",
+	}
+	err = saveImageCustomData(img2, customData2)
+	c.Assert(err, check.IsNil)
+	img3 := "tsuru/app-myapp:v3"
+	customData3 := map[string]interface{}{
+		"procfile": "api: python myapi.py",
+	}
+	err = saveImageCustomData(img3, customData3)
+	c.Assert(err, check.IsNil)
+	img4 := "tsuru/app-myapp:v4"
+	customData4 := map[string]interface{}{}
+	err = saveImageCustomData(img4, customData4)
+	c.Assert(err, check.IsNil)
+	web1, err := getImageWebProcessName(img1)
+	c.Check(err, check.IsNil)
+	c.Check(web1, check.Equals, "web")
+	web2, err := getImageWebProcessName(img2)
+	c.Check(err, check.IsNil)
+	c.Check(web2, check.Equals, "web")
+	web3, err := getImageWebProcessName(img3)
+	c.Check(err, check.IsNil)
+	c.Check(web3, check.Equals, "api")
+	web4, err := getImageWebProcessName(img4)
+	c.Check(err, check.IsNil)
+	c.Check(web4, check.Equals, "")
+	img5 := "tsuru/app-myapp:v5"
+	web5, err := getImageWebProcessName(img5)
+	c.Check(err, check.IsNil)
+	c.Check(web5, check.Equals, "")
 }

@@ -19,7 +19,6 @@ import (
 	"github.com/tsuru/tsuru/log"
 	"github.com/tsuru/tsuru/rec"
 	"github.com/tsuru/tsuru/repository"
-	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 )
 
@@ -175,27 +174,28 @@ func createTeam(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	return nil
 }
 
-// RemoveTeam removes a team document from the database.
 func removeTeam(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	conn, err := db.Conn()
+	name := r.URL.Query().Get(":name")
+	rec.Log(t.GetUserName(), "remove-team", name)
+	user, err := t.User()
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
-	name := r.URL.Query().Get(":name")
-	rec.Log(t.GetUserName(), "remove-team", name)
-	if n, err := conn.Apps().Find(bson.M{"teams": name}).Count(); err != nil || n > 0 {
-		msg := `This team cannot be removed because it have access to apps.
-
-Please remove the apps or revoke these accesses, and try again.`
-		return &errors.HTTP{Code: http.StatusForbidden, Message: msg}
-	}
-	query := bson.M{"_id": name, "users": t.GetUserName()}
-	err = conn.Teams().Remove(query)
-	if err == mgo.ErrNotFound {
+	if !user.IsAdmin() && !auth.CheckUserAccess([]string{name}, user) {
 		return &errors.HTTP{Code: http.StatusNotFound, Message: fmt.Sprintf(`Team "%s" not found.`, name)}
 	}
-	return err
+	err = auth.RemoveTeam(name)
+	if err != nil {
+		if _, ok := err.(*auth.ErrTeamStillUsed); ok {
+			msg := fmt.Sprintf("This team cannot be removed because there are still references to it:\n%s", err)
+			return &errors.HTTP{Code: http.StatusForbidden, Message: msg}
+		}
+		if err == auth.ErrTeamNotFound {
+			return &errors.HTTP{Code: http.StatusNotFound, Message: fmt.Sprintf(`Team "%s" not found.`, name)}
+		}
+		return err
+	}
+	return nil
 }
 
 func teamList(w http.ResponseWriter, r *http.Request, t auth.Token) error {
@@ -204,14 +204,22 @@ func teamList(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 		return err
 	}
 	rec.Log(u.Email, "list-teams")
-	teams, err := u.Teams()
+	var teams []auth.Team
+	if u.IsAdmin() {
+		teams, err = auth.ListTeams()
+	} else {
+		teams, err = u.Teams()
+	}
 	if err != nil {
 		return err
 	}
 	if len(teams) > 0 {
-		var result []map[string]string
+		var result []map[string]interface{}
 		for _, team := range teams {
-			result = append(result, map[string]string{"name": team.Name})
+			result = append(result, map[string]interface{}{
+				"name":   team.Name,
+				"member": team.ContainsUser(u),
+			})
 		}
 		w.Header().Set("Content-Type", "application/json")
 		b, err := json.Marshal(result)
@@ -386,16 +394,22 @@ func getTeam(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	return json.NewEncoder(w).Encode(team)
 }
 
-func getKeyFromBody(b io.Reader) (repository.Key, error) {
+type keyBody struct {
+	Name  string
+	Key   string
+	Force bool
+}
+
+func getKeyFromBody(b io.Reader) (repository.Key, bool, error) {
 	var key repository.Key
-	var body map[string]string
+	var body keyBody
 	err := json.NewDecoder(b).Decode(&body)
 	if err != nil {
-		return key, &errors.HTTP{Code: http.StatusBadRequest, Message: "Invalid JSON"}
+		return key, false, &errors.HTTP{Code: http.StatusBadRequest, Message: "Invalid JSON"}
 	}
-	key.Body = body["key"]
-	key.Name = body["name"]
-	return key, nil
+	key.Body = body.Key
+	key.Name = body.Name
+	return key, body.Force, nil
 }
 
 // AddKeyToUser adds a key to a user.
@@ -404,7 +418,7 @@ func getKeyFromBody(b io.Reader) (repository.Key, error) {
 // exists to be used in other places in the package without the http stuff (request and
 // response).
 func addKeyToUser(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	key, err := getKeyFromBody(r.Body)
+	key, force, err := getKeyFromBody(r.Body)
 	if err != nil {
 		return err
 	}
@@ -416,7 +430,7 @@ func addKeyToUser(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 		return err
 	}
 	rec.Log(u.Email, "add-key", key.Name, key.Body)
-	err = u.AddKey(key)
+	err = u.AddKey(key, force)
 	if err == auth.ErrKeyDisabled {
 		return &errors.HTTP{Code: http.StatusBadRequest, Message: err.Error()}
 	}
@@ -432,7 +446,7 @@ func addKeyToUser(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 // exists to be used in other places in the package without the http stuff (request and
 // response).
 func removeKeyFromUser(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	key, err := getKeyFromBody(r.Body)
+	key, _, err := getKeyFromBody(r.Body)
 	if err != nil {
 		return err
 	}
@@ -482,7 +496,7 @@ func removeUser(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	if email != "" && u.IsAdmin() {
 		u, err = auth.GetUserByEmail(email)
 		if err != nil {
-			return err
+			return &errors.HTTP{Code: http.StatusNotFound, Message: err.Error()}
 		}
 	} else if u.IsAdmin() {
 		return &errors.HTTP{Code: http.StatusBadRequest, Message: "please specify the user you want to remove"}
@@ -598,7 +612,6 @@ func userInfo(w http.ResponseWriter, r *http.Request, t auth.Token) error {
 	if teams, err := user.Teams(); err == nil {
 		teamNames = make([]string, len(teams))
 		for i, team := range teams {
-			println(team.Name)
 			teamNames[i] = team.Name
 		}
 	}

@@ -20,6 +20,7 @@ import (
 	"github.com/tsuru/tsuru/db/dbtest"
 	"github.com/tsuru/tsuru/errors"
 	"github.com/tsuru/tsuru/provision/provisiontest"
+	"github.com/tsuru/tsuru/router/routertest"
 	"github.com/tsuru/tsuru/service"
 	"gopkg.in/check.v1"
 	"gopkg.in/mgo.v2/bson"
@@ -44,6 +45,11 @@ func (s *BindSuite) SetUpSuite(c *check.C) {
 	config.Set("database:name", "tsuru_service_bind_test")
 	s.conn, err = db.Conn()
 	c.Assert(err, check.IsNil)
+}
+
+func (s *BindSuite) SetUpTest(c *check.C) {
+	routertest.FakeRouter.Reset()
+	dbtest.ClearAllCollections(s.conn.Apps().Database)
 	s.user = auth.User{Email: "sad-but-true@metallica.com"}
 	s.user.Create()
 	s.team = auth.Team{Name: "metallica", Users: []string{s.user.Email}}
@@ -52,7 +58,7 @@ func (s *BindSuite) SetUpSuite(c *check.C) {
 }
 
 func (s *BindSuite) TearDownSuite(c *check.C) {
-	dbtest.ClearAllCollections(s.conn.Apps().Database)
+	s.conn.Close()
 }
 
 func createTestApp(conn *db.Storage, name, framework string, teams []string) (app.App, error) {
@@ -83,8 +89,10 @@ func (s *BindSuite) TestBindUnit(c *check.C) {
 	defer s.conn.Apps().Remove(bson.M{"name": a.Name})
 	app.Provisioner.Provision(&a)
 	defer app.Provisioner.Destroy(&a)
-	app.Provisioner.AddUnits(&a, 1, nil)
-	err = instance.BindUnit(&a, a.GetUnits()[0])
+	app.Provisioner.AddUnits(&a, 1, "web", nil)
+	units, err := a.GetUnits()
+	c.Assert(err, check.IsNil)
+	err = instance.BindUnit(&a, units[0])
 	c.Assert(err, check.IsNil)
 	c.Assert(called, check.Equals, true)
 }
@@ -102,7 +110,7 @@ func (s *BindSuite) TestBindAppFailsWhenEndpointIsDown(c *check.C) {
 	defer s.conn.Apps().Remove(bson.M{"name": a.Name})
 	app.Provisioner.Provision(&a)
 	defer app.Provisioner.Destroy(&a)
-	app.Provisioner.AddUnits(&a, 1, nil)
+	app.Provisioner.AddUnits(&a, 1, "web", nil)
 	err = instance.BindApp(&a, nil)
 	c.Assert(err, check.NotNil)
 }
@@ -154,7 +162,7 @@ func (s *BindSuite) TestBindCallTheServiceAPIAndSetsEnvironmentVariableReturnedF
 	defer s.conn.Apps().Remove(bson.M{"name": a.Name})
 	app.Provisioner.Provision(&a)
 	defer app.Provisioner.Destroy(&a)
-	app.Provisioner.AddUnits(&a, 1, nil)
+	app.Provisioner.AddUnits(&a, 1, "web", nil)
 	err = instance.BindApp(&a, nil)
 	c.Assert(err, check.IsNil)
 	newApp, err := app.GetByName(a.Name)
@@ -216,7 +224,7 @@ func (s *BindSuite) TestBindAppMultiUnits(c *check.C) {
 	defer s.conn.Apps().Remove(bson.M{"name": a.Name})
 	app.Provisioner.Provision(&a)
 	defer app.Provisioner.Destroy(&a)
-	app.Provisioner.AddUnits(&a, 1, nil)
+	app.Provisioner.AddUnits(&a, 1, "web", nil)
 	err = instance.BindApp(&a, nil)
 	c.Assert(err, check.IsNil)
 	ok := make(chan bool)
@@ -327,17 +335,21 @@ func (s *BindSuite) TestUnbindUnit(c *check.C) {
 	defer s.conn.Apps().Remove(bson.M{"name": a.Name})
 	app.Provisioner.Provision(&a)
 	defer app.Provisioner.Destroy(&a)
-	app.Provisioner.AddUnits(&a, 1, nil)
+	app.Provisioner.AddUnits(&a, 1, "web", nil)
+	units, err := a.GetUnits()
+	c.Assert(err, check.IsNil)
 	instance := service.ServiceInstance{
 		Name:        "my-mysql",
 		ServiceName: "mysql",
 		Teams:       []string{s.team.Name},
 		Apps:        []string{"painkiller"},
-		Units:       []string{a.GetUnits()[0].GetName()},
+		Units:       []string{units[0].GetName()},
 	}
 	instance.Create()
 	defer s.conn.ServiceInstances().Remove(bson.M{"name": "my-mysql"})
-	err = instance.UnbindUnit(&a, a.GetUnits()[0])
+	units, err = a.GetUnits()
+	c.Assert(err, check.IsNil)
+	err = instance.UnbindUnit(&a, units[0])
 	c.Assert(err, check.IsNil)
 	c.Assert(called, check.Equals, true)
 	err = s.conn.ServiceInstances().Find(bson.M{"name": "my-mysql"}).One(&instance)
@@ -363,7 +375,7 @@ func (s *BindSuite) TestUnbindMultiUnits(c *check.C) {
 	defer s.conn.Apps().Remove(bson.M{"name": a.Name})
 	app.Provisioner.Provision(&a)
 	defer app.Provisioner.Destroy(&a)
-	units, _ := app.Provisioner.AddUnits(&a, 2, nil)
+	units, _ := app.Provisioner.AddUnits(&a, 2, "web", nil)
 	instance := service.ServiceInstance{
 		Name:        "my-mysql",
 		ServiceName: "mysql",
@@ -385,7 +397,7 @@ func (s *BindSuite) TestUnbindMultiUnits(c *check.C) {
 	select {
 	case <-ok:
 		c.SucceedNow()
-	case <-time.After(1 * time.Second):
+	case <-time.After(time.Second):
 		c.Error("endpoint not called")
 	}
 }
@@ -509,7 +521,7 @@ func (s *BindSuite) TestUnbindCallsTheUnbindMethodFromAPI(c *check.C) {
 	defer s.conn.Apps().Remove(bson.M{"name": a.Name})
 	app.Provisioner.Provision(&a)
 	defer app.Provisioner.Destroy(&a)
-	units, _ := app.Provisioner.AddUnits(&a, 1, nil)
+	units, _ := app.Provisioner.AddUnits(&a, 1, "web", nil)
 	instance := service.ServiceInstance{
 		Name:        "my-mysql",
 		ServiceName: "mysql",

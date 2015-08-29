@@ -7,8 +7,8 @@ package docker
 import (
 	"github.com/tsuru/tsuru/app"
 	"github.com/tsuru/tsuru/log"
-	_ "github.com/tsuru/tsuru/router/hipache"
-	_ "github.com/tsuru/tsuru/router/routertest"
+	"github.com/tsuru/tsuru/provision/docker/container"
+	"github.com/tsuru/tsuru/router"
 	"gopkg.in/mgo.v2/bson"
 )
 
@@ -17,7 +17,7 @@ func (p *dockerProvisioner) fixContainers() error {
 	if err != nil {
 		return err
 	}
-	err = runInContainers(containers, func(c *container, _ chan *container) error {
+	err = runInContainers(containers, func(c *container.Container, _ chan *container.Container) error {
 		return p.checkContainer(c)
 	}, nil, true)
 	if err != nil {
@@ -26,9 +26,9 @@ func (p *dockerProvisioner) fixContainers() error {
 	return err
 }
 
-func (p *dockerProvisioner) checkContainer(container *container) error {
-	if container.available() {
-		info, err := container.networkInfo(p)
+func (p *dockerProvisioner) checkContainer(container *container.Container) error {
+	if container.Available() {
+		info, err := container.NetworkInfo(p)
 		if err != nil {
 			return err
 		}
@@ -43,7 +43,7 @@ func (p *dockerProvisioner) checkContainer(container *container) error {
 	return nil
 }
 
-func (p *dockerProvisioner) fixContainer(container *container, info containerNetworkInfo) error {
+func (p *dockerProvisioner) fixContainer(container *container.Container, info container.NetworkInfo) error {
 	if info.HTTPHostPort == "" {
 		return nil
 	}
@@ -51,15 +51,21 @@ func (p *dockerProvisioner) fixContainer(container *container, info containerNet
 	if err != nil {
 		return err
 	}
-	router, err := getRouterForApp(appInstance)
+	r, err := getRouterForApp(appInstance)
 	if err != nil {
 		return err
 	}
-	router.RemoveRoute(container.AppName, container.getAddress())
+	err = r.RemoveRoute(container.AppName, container.Address())
+	if err != nil && err != router.ErrRouteNotFound {
+		return err
+	}
 	container.IP = info.IP
 	container.HostPort = info.HTTPHostPort
-	router.AddRoute(container.AppName, container.getAddress())
-	coll := p.collection()
+	err = r.AddRoute(container.AppName, container.Address())
+	if err != nil && err != router.ErrRouteExists {
+		return err
+	}
+	coll := p.Collection()
 	defer coll.Close()
 	return coll.Update(bson.M{"id": container.ID}, container)
 }

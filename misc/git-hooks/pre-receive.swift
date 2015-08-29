@@ -15,8 +15,8 @@
 #   - CONTAINER_NAME: name of the container where the script will store the
 #                     archives
 #   - TSURU_HOST: URL to the Tsuru API (for example: http://yourtsuru:8080)
-#   - TSURU_TOKEN: the token to communicate with the API (generated with `tsr
-#                  token`, in the server).
+#   - TSURU_TOKEN: the token to communicate with the API (generated with
+#                  `tsurud token`, in the server).
 
 while read oldrev newrev refname
 do
@@ -50,7 +50,7 @@ then
 else
 	ARCHIVE_URL=${CDN_URL}/${ARCHIVE_FILE_NAME}
 fi
-URL="${TSURU_HOST}/apps/${APP_NAME}/repository/clone"
+URL="${TSURU_HOST}/apps/${APP_NAME}/deploy"
 curl -H "Authorization: bearer ${TSURU_TOKEN}" -d "archive-url=${ARCHIVE_URL}&commit=${COMMIT}&user=${TSURU_USER}" -s -N $URL | tee /tmp/deploy-${APP_NAME}.log
 swift -q $AUTH_PARAMS delete $CONTAINER_NAME $ARCHIVE_FILE_NAME
 tail -1 /tmp/deploy-${APP_NAME}.log | grep -q "^OK$"

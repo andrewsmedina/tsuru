@@ -11,12 +11,10 @@ import (
 	"github.com/tsuru/docker-cluster/cluster"
 	"github.com/tsuru/tsuru/action"
 	"github.com/tsuru/tsuru/app"
-	"github.com/tsuru/tsuru/db"
 	"github.com/tsuru/tsuru/provision"
 	"github.com/tsuru/tsuru/provision/provisiontest"
 	"github.com/tsuru/tsuru/safe"
 	"gopkg.in/check.v1"
-	"gopkg.in/mgo.v2/bson"
 )
 
 func (s *S) TestRebalanceContainersManyAppsSegStress(c *check.C) {
@@ -26,6 +24,7 @@ func (s *S) TestRebalanceContainersManyAppsSegStress(c *check.C) {
 		newIp := fmt.Sprintf("127.0.0.%d", i+1)
 		otherServer, err := dtesting.NewServer(newIp+":0", nil, nil)
 		c.Assert(err, check.IsNil)
+		defer otherServer.Stop()
 		nodes = append(nodes, cluster.Node{Address: otherServer.URL(), Metadata: map[string]string{"pool": "pool1"}})
 		nodeHosts = append(nodeHosts, urlToHost(otherServer.URL()))
 	}
@@ -38,7 +37,8 @@ func (s *S) TestRebalanceContainersManyAppsSegStress(c *check.C) {
 	p.scheduler = &segregatedScheduler{provisioner: p}
 	p.cluster, err = cluster.New(p.scheduler, p.storage, nodes...)
 	c.Assert(err, check.IsNil)
-	err = provision.AddPool("pool1")
+	opts := provision.AddPoolOptions{Name: "pool1"}
+	err = provision.AddPool(opts)
 	c.Assert(err, check.IsNil)
 	err = provision.AddTeamsToPool("pool1", []string{"team1"})
 	c.Assert(err, check.IsNil)
@@ -46,7 +46,7 @@ func (s *S) TestRebalanceContainersManyAppsSegStress(c *check.C) {
 	maxContainers := 40
 	for i := 0; i < maxContainers; i++ {
 		appName := fmt.Sprintf("myapp-%d", i)
-		err := s.newFakeImage(p, "tsuru/app-"+appName)
+		err := s.newFakeImage(p, "tsuru/app-"+appName, nil)
 		c.Assert(err, check.IsNil)
 		appInstance := provisiontest.NewFakeApp(appName, "python", 0)
 		defer p.Destroy(appInstance)
@@ -62,7 +62,7 @@ func (s *S) TestRebalanceContainersManyAppsSegStress(c *check.C) {
 		}
 		args := changeUnitsPipelineArgs{
 			app:         appInstance,
-			unitsToAdd:  6,
+			toAdd:       map[string]*containersToAdd{"web": {Quantity: 6}},
 			imageId:     imageId,
 			provisioner: p,
 			toHost:      chosenNode,
@@ -80,11 +80,8 @@ func (s *S) TestRebalanceContainersManyAppsSegStress(c *check.C) {
 			TeamOwner: "team1",
 			Pool:      "pool1",
 		}
-		conn, err := db.Conn()
+		err = s.storage.Apps().Insert(appStruct)
 		c.Assert(err, check.IsNil)
-		err = conn.Apps().Insert(appStruct)
-		c.Assert(err, check.IsNil)
-		defer conn.Apps().Remove(bson.M{"name": appStruct.Name})
 	}
 	buf := safe.NewBuffer(nil)
 	cloneProv, err := p.rebalanceContainersByFilter(buf, []string{}, map[string]string{"pool": "pool1"}, false)

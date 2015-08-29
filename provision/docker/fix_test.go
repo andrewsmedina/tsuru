@@ -12,8 +12,9 @@ import (
 
 	"github.com/tsuru/docker-cluster/cluster"
 	"github.com/tsuru/tsuru/app"
-	"github.com/tsuru/tsuru/db"
 	"github.com/tsuru/tsuru/provision"
+	"github.com/tsuru/tsuru/provision/docker/container"
+	"github.com/tsuru/tsuru/provision/provisiontest"
 	"gopkg.in/check.v1"
 	"gopkg.in/mgo.v2/bson"
 )
@@ -68,10 +69,10 @@ func startDocker(hostPort string) (func(), *httptest.Server, *dockerProvisioner)
 func (s *S) TestFixContainers(c *check.C) {
 	cleanup, server, p := startDocker("9999")
 	defer cleanup()
-	coll := p.collection()
+	coll := p.Collection()
 	defer coll.Close()
 	err := coll.Insert(
-		container{
+		container.Container{
 			ID:       "9930c24f1c4x",
 			AppName:  "makea",
 			Type:     "python",
@@ -83,12 +84,11 @@ func (s *S) TestFixContainers(c *check.C) {
 	)
 	c.Assert(err, check.IsNil)
 	defer coll.RemoveAll(bson.M{"appname": "makea"})
-	conn, err := db.Conn()
+	err = s.storage.Apps().Insert(&app.App{Name: "makea"})
 	c.Assert(err, check.IsNil)
-	defer conn.Close()
-	err = conn.Apps().Insert(&app.App{Name: "makea"})
-	c.Assert(err, check.IsNil)
-	defer conn.Apps().RemoveAll(bson.M{"name": "makea"})
+	appInstance := provisiontest.NewFakeApp("makea", "python", 0)
+	defer p.Destroy(appInstance)
+	p.Provision(appInstance)
 	var storage cluster.MapStorage
 	storage.StoreContainer("9930c24f1c4x", server.URL)
 	p.cluster, err = cluster.New(nil, &storage,
@@ -97,7 +97,7 @@ func (s *S) TestFixContainers(c *check.C) {
 	c.Assert(err, check.IsNil)
 	err = p.fixContainers()
 	c.Assert(err, check.IsNil)
-	cont, err := p.getContainer("9930c24f1c4x")
+	cont, err := p.GetContainer("9930c24f1c4x")
 	c.Assert(err, check.IsNil)
 	c.Assert(cont.IP, check.Equals, "127.0.0.9")
 	c.Assert(cont.HostPort, check.Equals, "9999")
@@ -106,10 +106,10 @@ func (s *S) TestFixContainers(c *check.C) {
 func (s *S) TestFixContainersEmptyPortDoesNothing(c *check.C) {
 	cleanup, server, p := startDocker("")
 	defer cleanup()
-	coll := p.collection()
+	coll := p.Collection()
 	defer coll.Close()
 	err := coll.Insert(
-		container{
+		container.Container{
 			ID:       "9930c24f1c4x",
 			AppName:  "makea",
 			Type:     "python",
@@ -129,7 +129,7 @@ func (s *S) TestFixContainersEmptyPortDoesNothing(c *check.C) {
 	c.Assert(err, check.IsNil)
 	err = p.fixContainers()
 	c.Assert(err, check.IsNil)
-	cont, err := p.getContainer("9930c24f1c4x")
+	cont, err := p.GetContainer("9930c24f1c4x")
 	c.Assert(err, check.IsNil)
 	c.Assert(cont.IP, check.Equals, "")
 	c.Assert(cont.HostPort, check.Equals, "")

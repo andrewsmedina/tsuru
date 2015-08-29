@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/tsuru/config"
@@ -15,6 +16,7 @@ import (
 	"github.com/tsuru/tsuru/db"
 	"github.com/tsuru/tsuru/db/dbtest"
 	"github.com/tsuru/tsuru/router"
+	"github.com/tsuru/tsuru/router/routertest"
 	"gopkg.in/check.v1"
 )
 
@@ -23,12 +25,49 @@ func Test(t *testing.T) {
 }
 
 type S struct {
-	conn    *db.Storage
-	server  *httptest.Server
-	handler apitest.MultiTestHandler
+	conn       *db.Storage
+	server     *httptest.Server
+	rawHandler http.Handler
+	handler    apitest.MultiTestHandler
 }
 
 var _ = check.Suite(&S{})
+
+func init() {
+	base := &S{}
+	suite := &routertest.RouterSuite{
+		SetUpSuiteFunc:   base.SetUpSuite,
+		TearDownTestFunc: base.TearDownTest,
+	}
+	suite.SetUpTestFunc = func(c *check.C) {
+		config.Set("database:name", "router_generic_galeb_tests")
+		base.rawHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case "DELETE":
+				w.WriteHeader(http.StatusNoContent)
+			case "POST":
+				w.WriteHeader(http.StatusCreated)
+			}
+			var val string
+			switch r.URL.Path {
+			case "/api/backendpool/":
+				val = `{"_links":{"self":"pool1"}}`
+			case "/api/rule/":
+				val = `{"_links":{"self":"rule1"}}`
+			case "/api/virtualhost/":
+				val = `{"_links":{"self":"vh1"}}`
+			case "/api/backend/":
+				val = `{"_links":{"self":"backend1"}}`
+			}
+			w.Write([]byte(val))
+		})
+		base.SetUpTest(c)
+		gRouter, err := createRouter("routers:galeb")
+		c.Assert(err, check.IsNil)
+		suite.Router = gRouter
+	}
+	check.Suite(suite)
+}
 
 func (s *S) SetUpSuite(c *check.C) {
 	config.Set("routers:galeb:username", "myusername")
@@ -37,20 +76,27 @@ func (s *S) SetUpSuite(c *check.C) {
 	config.Set("routers:galeb:type", "galeb")
 	config.Set("database:url", "127.0.0.1:27017")
 	config.Set("database:name", "router_galeb_tests_s")
-	var err error
-	s.conn, err = db.Conn()
-	c.Assert(err, check.IsNil)
 }
 
 func (s *S) SetUpTest(c *check.C) {
+	var err error
+	s.conn, err = db.Conn()
+	c.Assert(err, check.IsNil)
 	s.handler = apitest.MultiTestHandler{}
-	s.server = httptest.NewServer(&s.handler)
+	var handler http.Handler
+	if s.rawHandler != nil {
+		handler = s.rawHandler
+	} else {
+		handler = &s.handler
+	}
+	s.server = httptest.NewServer(handler)
 	config.Set("routers:galeb:api-url", s.server.URL+"/api")
 	dbtest.ClearAllCollections(s.conn.Collection("router_galeb_tests").Database)
 }
 
 func (s *S) TearDownTest(c *check.C) {
 	s.server.Close()
+	s.conn.Close()
 }
 
 func (s *S) TestAddBackend(c *check.C) {
@@ -122,7 +168,7 @@ func (s *S) TestRemoveBackend(c *check.C) {
 		"/api/vh1", "/api/vh2", "/api/vh3", "/api/rule1", "/api/backend1",
 	})
 	_, err = router.Retrieve("myapp")
-	c.Assert(err, check.ErrorMatches, "not found")
+	c.Assert(err, check.Equals, router.ErrBackendNotFound)
 	_, err = getGalebData("myapp")
 	c.Assert(err, check.ErrorMatches, "not found")
 }
@@ -142,7 +188,8 @@ func (s *S) TestAddRoute(c *check.C) {
 	s.handler.RspCode = http.StatusCreated
 	gRouter, err := createRouter("routers:galeb")
 	c.Assert(err, check.IsNil)
-	err = gRouter.AddRoute("myapp", "10.9.2.1:44001")
+	addr, _ := url.Parse("http://10.9.2.1:44001")
+	err = gRouter.AddRoute("myapp", addr)
 	c.Assert(err, check.IsNil)
 	c.Assert(s.handler.Url, check.DeepEquals, []string{"/api/backend/"})
 	dbData, err := getGalebData("myapp")
@@ -173,7 +220,8 @@ func (s *S) TestAddRouteParsesURL(c *check.C) {
 	s.handler.RspCode = http.StatusCreated
 	gRouter, err := createRouter("routers:galeb")
 	c.Assert(err, check.IsNil)
-	err = gRouter.AddRoute("myapp", "http://10.9.9.9:11001/")
+	addr, _ := url.Parse("http://10.9.9.9:11001/")
+	err = gRouter.AddRoute("myapp", addr)
 	c.Assert(err, check.IsNil)
 	c.Assert(s.handler.Url, check.DeepEquals, []string{"/api/backend/"})
 	dbData, err := getGalebData("myapp")
@@ -203,7 +251,8 @@ func (s *S) TestRemoveRoute(c *check.C) {
 	s.handler.RspCode = http.StatusNoContent
 	gRouter, err := createRouter("routers:galeb")
 	c.Assert(err, check.IsNil)
-	err = gRouter.RemoveRoute("myapp", "10.1.1.10")
+	addr, _ := url.Parse("http://10.1.1.10")
+	err = gRouter.RemoveRoute("myapp", addr)
 	c.Assert(err, check.IsNil)
 	c.Assert(s.handler.Url, check.DeepEquals, []string{"/api/backend1"})
 	dbData, err := getGalebData("myapp")
@@ -225,7 +274,8 @@ func (s *S) TestRemoveRouteParsesURL(c *check.C) {
 	s.handler.RspCode = http.StatusNoContent
 	gRouter, err := createRouter("routers:galeb")
 	c.Assert(err, check.IsNil)
-	err = gRouter.RemoveRoute("myapp", "https://10.1.1.10:1010/")
+	addr, _ := url.Parse("https://10.1.1.10:1010/")
+	err = gRouter.RemoveRoute("myapp", addr)
 	c.Assert(err, check.IsNil)
 	c.Assert(s.handler.Url, check.DeepEquals, []string{"/api/backend1"})
 	dbData, err := getGalebData("myapp")
@@ -302,7 +352,9 @@ func (s *S) TestRoutes(c *check.C) {
 	c.Assert(err, check.IsNil)
 	routes, err := gRouter.Routes("myapp")
 	c.Assert(err, check.IsNil)
-	c.Assert(routes, check.DeepEquals, []string{"10.1.1.10", "10.1.1.11"})
+	route1, _ := url.Parse("http://10.1.1.10")
+	route2, _ := url.Parse("http://10.1.1.11")
+	c.Assert(routes, check.DeepEquals, []*url.URL{route1, route2})
 }
 
 func (s *S) TestSwap(c *check.C) {
@@ -319,11 +371,13 @@ func (s *S) TestSwap(c *check.C) {
 	c.Assert(err, check.IsNil)
 	err = gRouter.AddBackend(backend1)
 	c.Assert(err, check.IsNil)
-	err = gRouter.AddRoute(backend1, "http://127.0.0.1")
+	addr1, _ := url.Parse("http://127.0.0.1")
+	err = gRouter.AddRoute(backend1, addr1)
 	c.Assert(err, check.IsNil)
 	err = gRouter.AddBackend(backend2)
 	c.Assert(err, check.IsNil)
-	err = gRouter.AddRoute(backend2, "http://10.10.10.10")
+	addr2, _ := url.Parse("http://10.10.10.10")
+	err = gRouter.AddRoute(backend2, addr2)
 	c.Assert(err, check.IsNil)
 	err = gRouter.Swap(backend1, backend2)
 	c.Assert(err, check.IsNil)

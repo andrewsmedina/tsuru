@@ -32,10 +32,17 @@ func healthCheckDockerRegistry() error {
 		registry = "http://" + registry
 	}
 	registry = strings.TrimRight(registry, "/")
-	url := registry + "/v1/_ping"
-	resp, err := http.Get(url)
+	v1URL := registry + "/v1/_ping"
+	v2URL := registry + "/v2/"
+	resp, err := http.Get(v2URL)
 	if err != nil {
 		return err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		resp, err = http.Get(v1URL)
+		if err != nil {
+			return err
+		}
 	}
 	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
@@ -49,7 +56,7 @@ func healthCheckDockerRegistry() error {
 }
 
 func healthCheckDocker() error {
-	nodes, err := mainDockerProvisioner.getCluster().Nodes()
+	nodes, err := mainDockerProvisioner.Cluster().Nodes()
 	if err != nil {
 		return err
 	}

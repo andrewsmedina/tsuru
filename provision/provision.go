@@ -10,14 +10,24 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
+	"net/url"
 
 	"github.com/tsuru/tsuru/app/bind"
 )
 
-var ErrInvalidStatus = errors.New("invalid status")
+var (
+	ErrInvalidStatus = errors.New("invalid status")
+	ErrEmptyApp      = errors.New("no units for this app")
+	ErrUnitNotFound  = errors.New("unit not found")
+)
 
-var ErrEmptyApp = errors.New("no units for this app")
+type InvalidProcessError struct {
+	Msg string
+}
+
+func (e InvalidProcessError) Error() string {
+	return fmt.Sprintf("process error: %s", e.Msg)
+}
 
 // Status represents the status of a unit in tsuru.
 type Status string
@@ -92,11 +102,13 @@ const (
 // Unit represents a provision unit. Can be a machine, container or anything
 // IP-addressable.
 type Unit struct {
-	Name    string
-	AppName string
-	Type    string
-	Ip      string
-	Status  Status
+	Name        string
+	AppName     string
+	ProcessName string
+	Type        string
+	Ip          string
+	Status      Status
+	Address     *url.URL
 }
 
 // GetName returns the name of the unit.
@@ -142,14 +154,12 @@ type App interface {
 	// GetDeploy returns the deploys that an app has.
 	GetDeploys() uint
 
-	Units() []Unit
+	Units() ([]Unit, error)
 
 	// Run executes the command in app units. Commands executed with this
 	// method should have access to environment variables defined in the
 	// app.
 	Run(cmd string, w io.Writer, once bool) error
-
-	Restart(io.Writer) error
 
 	Envs() map[string]bind.EnvVar
 
@@ -178,7 +188,7 @@ type CNameManager interface {
 // Shell in the provisioner.
 type ShellOptions struct {
 	App    App
-	Conn   net.Conn
+	Conn   io.ReadWriteCloser
 	Width  int
 	Height int
 	Unit   string
@@ -223,15 +233,11 @@ type Provisioner interface {
 	// second is the number of units to be added.
 	//
 	// It returns a slice containing all added units
-	AddUnits(App, uint, io.Writer) ([]Unit, error)
+	AddUnits(App, uint, string, io.Writer) ([]Unit, error)
 
 	// RemoveUnits "undoes" AddUnits, removing the given number of units
 	// from the app.
-	RemoveUnits(App, uint) error
-
-	// RemoveUnit removes a unit from the app. It receives the unit to be
-	// removed.
-	RemoveUnit(Unit) error
+	RemoveUnits(App, uint, string, io.Writer) error
 
 	// SetUnitStatus changes the status of a unit.
 	SetUnitStatus(Unit, Status) error
@@ -242,11 +248,21 @@ type Provisioner interface {
 	// ExecuteCommandOnce runs a command in one unit of the app.
 	ExecuteCommandOnce(stdout, stderr io.Writer, app App, cmd string, args ...string) error
 
-	Restart(App, io.Writer) error
-	Stop(App) error
+	// Restart restarts the units of the application, with an optional
+	// string parameter represeting the name of the process to start. When
+	// the process is empty, Restart will restart all units of the
+	// application.
+	Restart(App, string, io.Writer) error
 
-	// Start start the app units.
-	Start(App) error
+	// Start starts the units of the application, with an optional string
+	// parameter represeting the name of the process to start. When the
+	// process is empty, Start will start all units of the application.
+	Start(App, string) error
+
+	// Stop stops the units of the application, with an optional string
+	// parameter represeting the name of the process to start. When the
+	// process is empty, Stop will stop all units of the application.
+	Stop(App, string) error
 
 	// Addr returns the address for an app.
 	//
@@ -259,7 +275,10 @@ type Provisioner interface {
 	Swap(App, App) error
 
 	// Units returns information about units by App.
-	Units(App) []Unit
+	Units(App) ([]Unit, error)
+
+	// RoutableUnits returns information about routable units by App.
+	RoutableUnits(App) ([]Unit, error)
 
 	// Register a unit after the container has been created or restarted.
 	RegisterUnit(Unit, map[string]interface{}) error
@@ -270,6 +289,9 @@ type Provisioner interface {
 	// Returns list of valid image names for app, these can be used for
 	// rollback.
 	ValidAppImages(string) ([]string, error)
+
+	// Returns the metric backend environs for the app.
+	MetricEnvs(App) map[string]string
 }
 
 type MessageProvisioner interface {

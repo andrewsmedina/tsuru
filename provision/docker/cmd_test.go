@@ -93,10 +93,11 @@ func (s *S) TestAddNodeWithErrorCmdRun(c *check.C) {
 func (s *S) TestRemoveNodeFromTheSchedulerCmdInfo(c *check.C) {
 	expected := cmd.Info{
 		Name:  "docker-node-remove",
-		Usage: "docker-node-remove <address> [--destroy] [-y]",
+		Usage: "docker-node-remove <address> [--no-rebalance] [--destroy] [-y]",
 		Desc: `Removes a node from the cluster.
 
 --destroy: Destroy the machine in the IaaS used to create it, if it exists.
+--no-rebalance: Do not rebalance containers of removed node.
 `,
 		MinArgs: 1,
 	}
@@ -159,6 +160,28 @@ func (s *S) TestRemoveNodeFromTheSchedulerWithDestroyCmdRunConfirmation(c *check
 	err := command.Run(&context, nil)
 	c.Assert(err, check.IsNil)
 	c.Assert(stdout.String(), check.Equals, "Are you sure you sure you want to remove \"http://localhost:8080\" from cluster? (y/n) Abort.\n")
+}
+
+func (s *S) TestRemoveNodeFromTheSchedulerWithNoRebalanceCmdRun(c *check.C) {
+	var buf bytes.Buffer
+	context := cmd.Context{Args: []string{"http://localhost:8080"}, Stdout: &buf}
+	trans := &cmdtest.ConditionalTransport{
+		Transport: cmdtest.Transport{Message: "", Status: http.StatusOK},
+		CondFunc: func(req *http.Request) bool {
+			var result map[string]string
+			json.NewDecoder(req.Body).Decode(&result)
+			return req.URL.Path == "/docker/node" &&
+				req.URL.Query().Get("no-rebalance") == "true" &&
+				result["address"] == "http://localhost:8080"
+		},
+	}
+	manager := cmd.Manager{}
+	client := cmd.NewClient(&http.Client{Transport: trans}, nil, &manager)
+	cmd := removeNodeFromSchedulerCmd{}
+	cmd.Flags().Parse(true, []string{"-y", "--no-rebalance"})
+	err := cmd.Run(&context, client)
+	c.Assert(err, check.IsNil)
+	c.Assert(buf.String(), check.Equals, "Node successfully removed.\n")
 }
 
 func (s *S) TestListNodesInTheSchedulerCmdInfo(c *check.C) {
@@ -253,165 +276,6 @@ func (s *S) TestListNodesInTheSchedulerCmdRunEmptyAll(c *check.C) {
 	c.Assert(buf.String(), check.Equals, expected)
 }
 
-func (s *S) TestListHealingHistoryCmdInfo(c *check.C) {
-	expected := cmd.Info{
-		Name:  "docker-healing-list",
-		Usage: "docker-healing-list [--node] [--container]",
-		Desc:  "List healing history for nodes or containers.",
-	}
-	cmd := listHealingHistoryCmd{}
-	c.Assert(cmd.Info(), check.DeepEquals, &expected)
-}
-
-var healingJsonData = `[{
-	"StartTime": "2014-10-23T08:00:00.000Z",
-	"EndTime": "2014-10-23T08:30:00.000Z",
-	"Successful": true,
-	"Action": "node-healing",
-	"FailingNode": {"Address": "addr1"},
-	"CreatedNode": {"Address": "addr2"},
-	"Error": ""
-},
-{
-	"StartTime": "2014-10-23T08:00:00.000Z",
-	"EndTime": "2014-10-23T08:30:00.000Z",
-	"Successful": true,
-	"Action": "container-healing",
-	"FailingContainer": {"ID": "123456789012"},
-	"CreatedContainer": {"ID": "923456789012"},
-	"Error": ""
-},
-{
-	"StartTime": "2014-10-23T08:00:00.000Z",
-	"EndTime": "2014-10-23T08:30:00.000Z",
-	"Successful": false,
-	"Action": "container-healing",
-	"FailingContainer": {"ID": "123456789012"},
-	"Error": "err1"
-}]`
-
-func (s *S) TestListHealingHistoryCmdRun(c *check.C) {
-	var buf bytes.Buffer
-	context := cmd.Context{Stdout: &buf}
-	trans := &cmdtest.ConditionalTransport{
-		Transport: cmdtest.Transport{Message: healingJsonData, Status: http.StatusOK},
-		CondFunc: func(req *http.Request) bool {
-			return req.URL.Path == "/docker/healing"
-		},
-	}
-	manager := cmd.Manager{}
-	client := cmd.NewClient(&http.Client{Transport: trans}, nil, &manager)
-	healing := &listHealingHistoryCmd{}
-	err := healing.Run(&context, client)
-	c.Assert(err, check.IsNil)
-	startT, _ := time.Parse(time.RFC3339, "2014-10-23T08:00:00.000Z")
-	endT, _ := time.Parse(time.RFC3339, "2014-10-23T08:30:00.000Z")
-	startTStr := startT.Local().Format(time.Stamp)
-	endTStr := endT.Local().Format(time.Stamp)
-	expected := fmt.Sprintf(`Node:
-+-----------------+-----------------+---------+---------+---------+-------+
-| Start           | Finish          | Success | Failing | Created | Error |
-+-----------------+-----------------+---------+---------+---------+-------+
-| %s | %s | true    | addr1   | addr2   |       |
-+-----------------+-----------------+---------+---------+---------+-------+
-Container:
-+-----------------+-----------------+---------+------------+------------+-------+
-| Start           | Finish          | Success | Failing    | Created    | Error |
-+-----------------+-----------------+---------+------------+------------+-------+
-| %s | %s | false   | 1234567890 |            | err1  |
-+-----------------+-----------------+---------+------------+------------+-------+
-| %s | %s | true    | 1234567890 | 9234567890 |       |
-+-----------------+-----------------+---------+------------+------------+-------+
-`, startTStr, endTStr, startTStr, endTStr, startTStr, endTStr)
-	c.Assert(buf.String(), check.Equals, expected)
-}
-
-func (s *S) TestListHealingHistoryCmdRunEmpty(c *check.C) {
-	var buf bytes.Buffer
-	context := cmd.Context{Stdout: &buf}
-	trans := &cmdtest.ConditionalTransport{
-		Transport: cmdtest.Transport{Message: `[]`, Status: http.StatusOK},
-		CondFunc: func(req *http.Request) bool {
-			return req.URL.Path == "/docker/healing"
-		},
-	}
-	manager := cmd.Manager{}
-	client := cmd.NewClient(&http.Client{Transport: trans}, nil, &manager)
-	healing := &listHealingHistoryCmd{}
-	err := healing.Run(&context, client)
-	c.Assert(err, check.IsNil)
-	expected := `Node:
-+-------+--------+---------+---------+---------+-------+
-| Start | Finish | Success | Failing | Created | Error |
-+-------+--------+---------+---------+---------+-------+
-Container:
-+-------+--------+---------+---------+---------+-------+
-| Start | Finish | Success | Failing | Created | Error |
-+-------+--------+---------+---------+---------+-------+
-`
-	c.Assert(buf.String(), check.Equals, expected)
-}
-
-func (s *S) TestListHealingHistoryCmdRunFilterNode(c *check.C) {
-	var buf bytes.Buffer
-	context := cmd.Context{Stdout: &buf}
-	trans := &cmdtest.ConditionalTransport{
-		Transport: cmdtest.Transport{Message: healingJsonData, Status: http.StatusOK},
-		CondFunc: func(req *http.Request) bool {
-			return req.URL.Path == "/docker/healing" && req.URL.RawQuery == "filter=node"
-		},
-	}
-	manager := cmd.Manager{}
-	client := cmd.NewClient(&http.Client{Transport: trans}, nil, &manager)
-	cmd := &listHealingHistoryCmd{}
-	cmd.Flags().Parse(true, []string{"--node"})
-	err := cmd.Run(&context, client)
-	c.Assert(err, check.IsNil)
-	startT, _ := time.Parse(time.RFC3339, "2014-10-23T08:00:00.000Z")
-	endT, _ := time.Parse(time.RFC3339, "2014-10-23T08:30:00.000Z")
-	startTStr := startT.Local().Format(time.Stamp)
-	endTStr := endT.Local().Format(time.Stamp)
-	expected := fmt.Sprintf(`Node:
-+-----------------+-----------------+---------+---------+---------+-------+
-| Start           | Finish          | Success | Failing | Created | Error |
-+-----------------+-----------------+---------+---------+---------+-------+
-| %s | %s | true    | addr1   | addr2   |       |
-+-----------------+-----------------+---------+---------+---------+-------+
-`, startTStr, endTStr)
-	c.Assert(buf.String(), check.Equals, expected)
-}
-
-func (s *S) TestListHealingHistoryCmdRunFilterContainer(c *check.C) {
-	var buf bytes.Buffer
-	context := cmd.Context{Stdout: &buf}
-	trans := &cmdtest.ConditionalTransport{
-		Transport: cmdtest.Transport{Message: healingJsonData, Status: http.StatusOK},
-		CondFunc: func(req *http.Request) bool {
-			return req.URL.Path == "/docker/healing" && req.URL.RawQuery == "filter=container"
-		},
-	}
-	manager := cmd.Manager{}
-	client := cmd.NewClient(&http.Client{Transport: trans}, nil, &manager)
-	cmd := &listHealingHistoryCmd{}
-	cmd.Flags().Parse(true, []string{"--container"})
-	err := cmd.Run(&context, client)
-	c.Assert(err, check.IsNil)
-	startT, _ := time.Parse(time.RFC3339, "2014-10-23T08:00:00.000Z")
-	endT, _ := time.Parse(time.RFC3339, "2014-10-23T08:30:00.000Z")
-	startTStr := startT.Local().Format(time.Stamp)
-	endTStr := endT.Local().Format(time.Stamp)
-	expected := fmt.Sprintf(`Container:
-+-----------------+-----------------+---------+------------+------------+-------+
-| Start           | Finish          | Success | Failing    | Created    | Error |
-+-----------------+-----------------+---------+------------+------------+-------+
-| %s | %s | false   | 1234567890 |            | err1  |
-+-----------------+-----------------+---------+------------+------------+-------+
-| %s | %s | true    | 1234567890 | 9234567890 |       |
-+-----------------+-----------------+---------+------------+------------+-------+
-`, startTStr, endTStr, startTStr, endTStr)
-	c.Assert(buf.String(), check.Equals, expected)
-}
-
 func (s *S) TestListAutoScaleHistoryCmdRunEmpty(c *check.C) {
 	var buf bytes.Buffer
 	context := cmd.Context{Stdout: &buf}
@@ -497,7 +361,7 @@ func (s *S) TestUpdateNodeToTheSchedulerCmdRun(c *check.C) {
 			err := json.Unmarshal(body, &parsed)
 			c.Assert(err, check.IsNil)
 			c.Assert(parsed, check.DeepEquals, expectedBody)
-			return req.URL.Path == "/docker/node" && req.Method == "PUT"
+			return req.URL.Path == "/docker/node" && req.Method == "PUT" && req.URL.Query().Get("disabled") == "false"
 		},
 	}
 	manager := cmd.Manager{}
@@ -508,7 +372,25 @@ func (s *S) TestUpdateNodeToTheSchedulerCmdRun(c *check.C) {
 	c.Assert(buf.String(), check.Equals, "Node successfully updated.\n")
 }
 
-func (s *S) TestListAutoScaleRunCmdRun(c *check.C) {
+func (s *S) TestUpdateNodeToDisableCmdRun(c *check.C) {
+	var buf bytes.Buffer
+	context := cmd.Context{Args: []string{"http://localhost:1111", "x=y", "y=z"}, Stdout: &buf}
+	trans := &cmdtest.ConditionalTransport{
+		Transport: cmdtest.Transport{Message: "", Status: http.StatusOK},
+		CondFunc: func(req *http.Request) bool {
+			return req.URL.Query().Get("disabled") == "true"
+		},
+	}
+	manager := cmd.Manager{}
+	client := cmd.NewClient(&http.Client{Transport: trans}, nil, &manager)
+	cm := updateNodeToSchedulerCmd{}
+	cm.Flags().Parse(true, []string{"--disable"})
+	err := cm.Run(&context, client)
+	c.Assert(err, check.IsNil)
+	c.Assert(buf.String(), check.Equals, "Node successfully updated.\n")
+}
+
+func (s *S) TestAutoScaleRunCmdRun(c *check.C) {
 	var stdout, stderr bytes.Buffer
 	msg, _ := json.Marshal(tsuruIo.SimpleJsonMessage{Message: "progress msg"})
 	result := string(msg)
@@ -524,9 +406,219 @@ func (s *S) TestListAutoScaleRunCmdRun(c *check.C) {
 	}
 	manager := cmd.Manager{}
 	client := cmd.NewClient(&http.Client{Transport: trans}, nil, &manager)
-	cm := listAutoScaleRunCmd{}
+	cm := autoScaleRunCmd{}
 	cm.Flags().Parse(true, []string{"-y"})
 	err := cm.Run(&context, client)
 	c.Assert(err, check.IsNil)
 	c.Assert(stdout.String(), check.Equals, "progress msg")
+}
+
+func (s *S) TestAutoScaleInfoCmdRun(c *check.C) {
+	var calls int
+	config := `{"GroupByMetadata":"pool","Enabled":true}`
+	configTransport := cmdtest.ConditionalTransport{
+		Transport: cmdtest.Transport{Message: config, Status: http.StatusOK},
+		CondFunc: func(req *http.Request) bool {
+			calls++
+			return req.URL.Path == "/docker/autoscale/config" && req.Method == "GET"
+		},
+	}
+	rules := `[
+	{
+		"MetadataFilter":"pool1",
+		"Enabled":true,
+		"MaxContainerCount":6,
+		"ScaleDownRatio":1.33,
+		"PreventRebalance":false,
+		"MaxMemoryRatio":1.20,
+		"Error": ""
+	},
+	{
+		"MetadataFilter":"pool2",
+		"Enabled":true,
+		"MaxContainerCount":13,
+		"ScaleDownRatio":1.33,
+		"PreventRebalance":true,
+		"MaxMemoryRatio":0.9,
+		"Error": ""
+	},
+	{
+		"MetadataFilter":"pool3",
+		"Enabled":false,
+		"MaxContainerCount":50,
+		"ScaleDownRatio":1.33,
+		"PreventRebalance":false,
+		"MaxMemoryRatio":1.20,
+		"Error": "something went wrong"
+	}
+]`
+	rulesTransport := cmdtest.ConditionalTransport{
+		Transport: cmdtest.Transport{Message: rules, Status: http.StatusOK},
+		CondFunc: func(req *http.Request) bool {
+			calls++
+			return req.URL.Path == "/docker/autoscale/rules" && req.Method == "GET"
+		},
+	}
+	var buf bytes.Buffer
+	context := cmd.Context{Stdout: &buf}
+	manager := cmd.Manager{}
+	trans := cmdtest.MultiConditionalTransport{
+		ConditionalTransports: []cmdtest.ConditionalTransport{configTransport, rulesTransport},
+	}
+	client := cmd.NewClient(&http.Client{Transport: &trans}, nil, &manager)
+	var command autoScaleInfoCmd
+	err := command.Run(&context, client)
+	c.Assert(err, check.IsNil)
+	expected := `Metadata filter: pool
+
+Rules:
++--------------+---------------------+------------------+------------------+--------------------+---------+
+| Filter value | Max container count | Max memory ratio | Scale down ratio | Rebalance on scale | Enabled |
++--------------+---------------------+------------------+------------------+--------------------+---------+
+| pool1        | 6                   | 1.2000           | 1.3300           | true               | true    |
+| pool2        | 13                  | 0.9000           | 1.3300           | false              | true    |
+| pool3        | 50                  | 1.2000           | 1.3300           | true               | false   |
++--------------+---------------------+------------------+------------------+--------------------+---------+
+`
+	c.Assert(buf.String(), check.Equals, expected)
+	c.Assert(calls, check.Equals, 2)
+}
+
+func (s *S) TestAutoScaleInfoCmdRunDisabled(c *check.C) {
+	var calls int
+	config := `{"GroupByMetadata":"pool","Enabled":false}`
+	transport := cmdtest.ConditionalTransport{
+		Transport: cmdtest.Transport{Message: config, Status: http.StatusOK},
+		CondFunc: func(req *http.Request) bool {
+			calls++
+			return req.URL.Path == "/docker/autoscale/config" && req.Method == "GET"
+		},
+	}
+	var buf bytes.Buffer
+	context := cmd.Context{Stdout: &buf}
+	manager := cmd.Manager{}
+	client := cmd.NewClient(&http.Client{Transport: &transport}, nil, &manager)
+	var command autoScaleInfoCmd
+	err := command.Run(&context, client)
+	c.Assert(err, check.IsNil)
+	c.Assert(buf.String(), check.Equals, "auto-scale is disabled\n")
+	c.Assert(calls, check.Equals, 1)
+}
+
+func (s *S) TestAutoScaleSetRuleCmdRun(c *check.C) {
+	var called bool
+	transport := cmdtest.ConditionalTransport{
+		Transport: cmdtest.Transport{Message: "", Status: http.StatusOK},
+		CondFunc: func(req *http.Request) bool {
+			called = true
+			var rule autoScaleRule
+			err := json.NewDecoder(req.Body).Decode(&rule)
+			c.Assert(err, check.IsNil)
+			c.Assert(rule, check.DeepEquals, autoScaleRule{
+				MetadataFilter:    "pool1",
+				Enabled:           true,
+				MaxContainerCount: 10,
+				MaxMemoryRatio:    1.2342,
+				ScaleDownRatio:    1.33,
+				PreventRebalance:  false,
+			})
+			return req.Method == "POST" && req.URL.Path == "/docker/autoscale/rules"
+		},
+	}
+	var buf bytes.Buffer
+	context := cmd.Context{Stdout: &buf}
+	var manager cmd.Manager
+	client := cmd.NewClient(&http.Client{Transport: &transport}, nil, &manager)
+	var command autoScaleSetRuleCmd
+	flags := []string{"-f", "pool1", "-c", "10", "-m", "1.2342"}
+	err := command.Flags().Parse(true, flags)
+	c.Assert(err, check.IsNil)
+	err = command.Run(&context, client)
+	c.Assert(err, check.IsNil)
+	c.Assert(called, check.Equals, true)
+	c.Assert(buf.String(), check.Equals, "Rule successfully defined.\n")
+}
+
+func (s *S) TestAutoScaleDeleteCmdRun(c *check.C) {
+	var called bool
+	transport := cmdtest.ConditionalTransport{
+		Transport: cmdtest.Transport{Message: "", Status: http.StatusOK},
+		CondFunc: func(req *http.Request) bool {
+			called = true
+			return req.Method == "DELETE" && req.URL.Path == "/docker/autoscale/rules/myrule"
+		},
+	}
+	var buf bytes.Buffer
+	context := cmd.Context{Args: []string{"myrule"}, Stdout: &buf}
+	var manager cmd.Manager
+	client := cmd.NewClient(&http.Client{Transport: &transport}, nil, &manager)
+	var command autoScaleDeleteRuleCmd
+	err := command.Flags().Parse(true, []string{"-y"})
+	c.Assert(err, check.IsNil)
+	err = command.Run(&context, client)
+	c.Assert(err, check.IsNil)
+	c.Assert(called, check.Equals, true)
+	c.Assert(buf.String(), check.Equals, "Rule successfully removed.\n")
+}
+
+func (s *S) TestAutoScaleDeleteCmdRunAskForConfirmation(c *check.C) {
+	var called bool
+	transport := cmdtest.ConditionalTransport{
+		Transport: cmdtest.Transport{Message: "", Status: http.StatusOK},
+		CondFunc: func(req *http.Request) bool {
+			called = true
+			return req.Method == "DELETE" && req.URL.Path == "/docker/autoscale/rules/myrule"
+		},
+	}
+	var buf bytes.Buffer
+	context := cmd.Context{Args: []string{"myrule"}, Stdout: &buf, Stdin: strings.NewReader("y\n")}
+	var manager cmd.Manager
+	client := cmd.NewClient(&http.Client{Transport: &transport}, nil, &manager)
+	var command autoScaleDeleteRuleCmd
+	err := command.Run(&context, client)
+	c.Assert(err, check.IsNil)
+	c.Assert(called, check.Equals, true)
+	c.Assert(buf.String(), check.Equals, "Are you sure you want to remove the rule \"myrule\"? (y/n) Rule successfully removed.\n")
+}
+
+func (s *S) TestAutoScaleDeleteCmdRunDefault(c *check.C) {
+	var called bool
+	transport := cmdtest.ConditionalTransport{
+		Transport: cmdtest.Transport{Message: "", Status: http.StatusOK},
+		CondFunc: func(req *http.Request) bool {
+			called = true
+			return req.Method == "DELETE" && req.URL.Path == "/docker/autoscale/rules/"
+		},
+	}
+	var buf bytes.Buffer
+	context := cmd.Context{Stdout: &buf}
+	var manager cmd.Manager
+	client := cmd.NewClient(&http.Client{Transport: &transport}, nil, &manager)
+	var command autoScaleDeleteRuleCmd
+	err := command.Flags().Parse(true, []string{"-y"})
+	c.Assert(err, check.IsNil)
+	err = command.Run(&context, client)
+	c.Assert(err, check.IsNil)
+	c.Assert(called, check.Equals, true)
+	c.Assert(buf.String(), check.Equals, "Rule successfully removed.\n")
+}
+
+func (s *S) TestAutoScaleDeleteCmdRunDefaultAskForConfirmation(c *check.C) {
+	var called bool
+	transport := cmdtest.ConditionalTransport{
+		Transport: cmdtest.Transport{Message: "", Status: http.StatusOK},
+		CondFunc: func(req *http.Request) bool {
+			called = true
+			return req.Method == "DELETE" && req.URL.Path == "/docker/autoscale/rules/"
+		},
+	}
+	var buf bytes.Buffer
+	context := cmd.Context{Stdout: &buf, Stdin: strings.NewReader("y\n")}
+	var manager cmd.Manager
+	client := cmd.NewClient(&http.Client{Transport: &transport}, nil, &manager)
+	var command autoScaleDeleteRuleCmd
+	err := command.Run(&context, client)
+	c.Assert(err, check.IsNil)
+	c.Assert(called, check.Equals, true)
+	c.Assert(buf.String(), check.Equals, "Are you sure you want to remove the default rule? (y/n) Rule successfully removed.\n")
 }

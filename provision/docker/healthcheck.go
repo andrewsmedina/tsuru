@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tsuru/config"
+	"github.com/tsuru/tsuru/provision/docker/container"
 )
 
 func clientWithTimeout(dialTimeout time.Duration) *http.Client {
@@ -27,14 +28,14 @@ func clientWithTimeout(dialTimeout time.Duration) *http.Client {
 	}
 	return &http.Client{
 		Transport: &transport,
-		Timeout:   1 * time.Minute,
+		Timeout:   time.Minute,
 	}
 }
 
 var timeoutHttpClient = clientWithTimeout(5 * time.Second)
 
-func runHealthcheck(cont *container, w io.Writer) error {
-	yamlData, err := getImageTsuruYamlDataWithFallback(cont.Image, cont.AppName)
+func runHealthcheck(cont *container.Container, w io.Writer) error {
+	yamlData, err := getImageTsuruYamlData(cont.Image)
 	if err != nil {
 		return err
 	}
@@ -62,11 +63,11 @@ func runHealthcheck(cont *container, w io.Writer) error {
 			return err
 		}
 	}
-	maxWaitTime, _ := config.GetDuration("docker:healthcheck:max-time")
+	maxWaitTime, _ := config.GetInt("docker:healthcheck:max-time")
 	if maxWaitTime == 0 {
 		maxWaitTime = 120
 	}
-	maxWaitTime = maxWaitTime * time.Second
+	maxWaitTime = maxWaitTime * int(time.Second)
 	sleepTime := 3 * time.Second
 	startedTime := time.Now()
 	url := fmt.Sprintf("http://%s:%s/%s", cont.HostAddr, cont.HostPort, path)
@@ -78,11 +79,11 @@ func runHealthcheck(cont *container, w io.Writer) error {
 		}
 		rsp, err := timeoutHttpClient.Do(req)
 		if err != nil {
-			lastError = fmt.Errorf("healthcheck fail(%s): %s", cont.shortID(), err.Error())
+			lastError = fmt.Errorf("healthcheck fail(%s): %s", cont.ShortID(), err.Error())
 		} else {
 			defer rsp.Body.Close()
 			if status != 0 && rsp.StatusCode != status {
-				lastError = fmt.Errorf("healthcheck fail(%s): wrong status code, expected %d, got: %d", cont.shortID(), status, rsp.StatusCode)
+				lastError = fmt.Errorf("healthcheck fail(%s): wrong status code, expected %d, got: %d", cont.ShortID(), status, rsp.StatusCode)
 			} else if matchRE != nil {
 				result, err := ioutil.ReadAll(rsp.Body)
 
@@ -90,7 +91,7 @@ func runHealthcheck(cont *container, w io.Writer) error {
 					lastError = err
 				}
 				if !matchRE.Match(result) {
-					lastError = fmt.Errorf("healthcheck fail(%s): unexpected result, expected %q, got: %s", cont.shortID(), match, string(result))
+					lastError = fmt.Errorf("healthcheck fail(%s): unexpected result, expected %q, got: %s", cont.ShortID(), match, string(result))
 				}
 			}
 			if lastError != nil {
@@ -101,13 +102,13 @@ func runHealthcheck(cont *container, w io.Writer) error {
 			}
 		}
 		if lastError == nil {
-			fmt.Fprintf(w, " ---> healthcheck successful(%s)\n", cont.shortID())
+			fmt.Fprintf(w, " ---> healthcheck successful(%s)\n", cont.ShortID())
 			return nil
 		}
-		if time.Now().Sub(startedTime) > maxWaitTime {
+		if time.Now().Sub(startedTime) > time.Duration(maxWaitTime) {
 			return lastError
 		}
-		fmt.Fprintf(w, " ---> %s. Trying again in %ds\n", lastError.Error(), sleepTime/time.Second)
+		fmt.Fprintf(w, " ---> %s. Trying again in %s\n", lastError.Error(), sleepTime)
 		time.Sleep(sleepTime)
 	}
 }

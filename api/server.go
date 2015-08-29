@@ -23,10 +23,11 @@ import (
 	"github.com/tsuru/tsuru/log"
 	"github.com/tsuru/tsuru/provision"
 	"github.com/tsuru/tsuru/router"
+	"golang.org/x/net/websocket"
 	"gopkg.in/tylerb/graceful.v1"
 )
 
-const Version = "0.11.2"
+const Version = "0.12.0"
 
 func getProvisioner() (string, error) {
 	provisioner, err := config.GetString("provisioner")
@@ -119,6 +120,7 @@ func RunServer(dry bool) http.Handler {
 	m.Add("Get", "/apps/{app}", authorizationRequiredHandler(appInfo))
 	m.Add("Post", "/apps/{app}/cname", authorizationRequiredHandler(setCName))
 	m.Add("Delete", "/apps/{app}/cname", authorizationRequiredHandler(unsetCName))
+	m.Add("Post", "/apps/{app}/plan", authorizationRequiredHandler(changePlan))
 	runHandler := authorizationRequiredHandler(runCommand)
 	m.Add("Post", "/apps/{app}/run", runHandler)
 	m.Add("Post", "/apps/{app}/restart", authorizationRequiredHandler(restart))
@@ -145,11 +147,12 @@ func RunServer(dry bool) http.Handler {
 	m.Add("Get", "/apps/{app}/log", authorizationRequiredHandler(appLog))
 	logPostHandler := authorizationRequiredHandler(addLog)
 	m.Add("Post", "/apps/{app}/log", logPostHandler)
-	saveCustomDataHandler := authorizationRequiredHandler(saveAppCustomData)
-	m.Add("Post", "/apps/{app}/customdata", saveCustomDataHandler)
 	m.Add("Post", "/apps/{appname}/deploy/rollback", authorizationRequiredHandler(deployRollback))
-	m.Add("Get", "/apps/{app}/shell", authorizationRequiredHandler(remoteShellHandler))
 	m.Add("Post", "/apps/{app}/pool", authorizationRequiredHandler(appChangePool))
+	m.Add("Get", "/apps/{app}/metric/envs", authorizationRequiredHandler(appMetricEnvs))
+	m.Add("Post", "/apps/{app}/routes", AdminRequiredHandler(appRebuildRoutes))
+
+	m.Add("Post", "/units/status", authorizationRequiredHandler(setUnitsStatus))
 
 	m.Add("Get", "/deploys", authorizationRequiredHandler(deploysList))
 	m.Add("Get", "/deploys/{deploy}", authorizationRequiredHandler(deployInfo))
@@ -159,12 +162,16 @@ func RunServer(dry bool) http.Handler {
 	m.Add("Put", "/platforms/{name}", AdminRequiredHandler(platformUpdate))
 	m.Add("Delete", "/platforms/{name}", AdminRequiredHandler(platformRemove))
 
-	// These handlers don't use :app on purpose. Using :app means that only
+	// These handlers don't use {app} on purpose. Using :app means that only
 	// the token generate for the given app is valid, but these handlers
 	// use a token generated for Gandalf.
 	m.Add("Get", "/apps/{appname}/available", authorizationRequiredHandler(appIsAvailable))
 	m.Add("Post", "/apps/{appname}/repository/clone", authorizationRequiredHandler(deploy))
 	m.Add("Post", "/apps/{appname}/deploy", authorizationRequiredHandler(deploy))
+
+	// Shell also doesn't use {app} on purpose. Middlewares don't play well
+	// with websocket.
+	m.Add("Get", "/apps/{appname}/shell", websocket.Handler(remoteShellHandler))
 
 	m.Add("Get", "/users", AdminRequiredHandler(listUsers))
 	m.Add("Post", "/users", Handler(createUser))
@@ -185,6 +192,7 @@ func RunServer(dry bool) http.Handler {
 	m.Add("Post", "/users/api-key", authorizationRequiredHandler(regenerateAPIToken))
 
 	m.Add("Delete", "/logs", AdminRequiredHandler(logRemove))
+	m.Add("Get", "/logs", websocket.Handler(addLogs))
 
 	m.Add("Get", "/teams", authorizationRequiredHandler(teamList))
 	m.Add("Post", "/teams", authorizationRequiredHandler(createTeam))
@@ -201,6 +209,7 @@ func RunServer(dry bool) http.Handler {
 	m.Add("Delete", "/iaas/machines/{machine_id}", AdminRequiredHandler(machineDestroy))
 	m.Add("Get", "/iaas/templates", AdminRequiredHandler(templatesList))
 	m.Add("Post", "/iaas/templates", AdminRequiredHandler(templateCreate))
+	m.Add("Put", "/iaas/templates/{template_name}", AdminRequiredHandler(templateUpdate))
 	m.Add("Delete", "/iaas/templates/{template_name}", AdminRequiredHandler(templateDestroy))
 
 	m.Add("Get", "/plans", authorizationRequiredHandler(listPlans))
@@ -214,8 +223,9 @@ func RunServer(dry bool) http.Handler {
 	m.Add("Get", "/pool", AdminRequiredHandler(listPoolHandler))
 	m.Add("Post", "/pool", AdminRequiredHandler(addPoolHandler))
 	m.Add("Delete", "/pool", AdminRequiredHandler(removePoolHandler))
-	m.Add("Post", "/pool/team", AdminRequiredHandler(addTeamToPoolHandler))
-	m.Add("Delete", "/pool/team", AdminRequiredHandler(removeTeamToPoolHandler))
+	m.Add("Post", "/pool/{name}", AdminRequiredHandler(poolUpdateHandler))
+	m.Add("Post", "/pool/{name}/team", AdminRequiredHandler(addTeamToPoolHandler))
+	m.Add("Delete", "/pool/{name}/team", AdminRequiredHandler(removeTeamToPoolHandler))
 
 	m.Add("Get", "/debug/pprof/", AdminRequiredHandler(indexHandler))
 	m.Add("Get", "/debug/pprof/cmdline", AdminRequiredHandler(cmdlineHandler))
@@ -240,7 +250,6 @@ func RunServer(dry bool) http.Handler {
 		runHandler,
 		forceDeleteLockHandler,
 		registerUnitHandler,
-		saveCustomDataHandler,
 		setUnitStatusHandler,
 	}})
 	n.UseHandler(http.HandlerFunc(runDelayedHandler))
@@ -315,19 +324,22 @@ func RunServer(dry bool) http.Handler {
 			fatal(err)
 		}
 		shutdownChan := make(chan bool)
-		shutdownTimeout, _ := config.GetDuration("shutdown-timeout")
+		shutdownTimeout, _ := config.GetInt("shutdown-timeout")
 		if shutdownTimeout == 0 {
 			shutdownTimeout = 10 * 60
 		}
-		shutdownTimeout = shutdownTimeout * time.Second
 		idleTracker := newIdleTracker()
 		shutdown.Register(idleTracker)
 		shutdown.Register(&logTracker)
+		readTimeout, _ := config.GetInt("server:read-timeout")
+		writeTimeout, _ := config.GetInt("server:write-timeout")
 		srv := &graceful.Server{
-			Timeout: shutdownTimeout,
+			Timeout: time.Duration(shutdownTimeout) * time.Second,
 			Server: &http.Server{
-				Addr:    listen,
-				Handler: n,
+				ReadTimeout:  time.Duration(readTimeout) * time.Second,
+				WriteTimeout: time.Duration(writeTimeout) * time.Second,
+				Addr:         listen,
+				Handler:      n,
 			},
 			ConnState: func(conn net.Conn, state http.ConnState) {
 				idleTracker.trackConn(conn, state)
@@ -366,9 +378,7 @@ func RunServer(dry bool) http.Handler {
 			err = srv.ListenAndServe()
 		}
 		if err != nil {
-			if opError, ok := err.(*net.OpError); !ok || opError.Op != "accept" {
-				fmt.Printf("Listening stopped: %s\n", err)
-			}
+			fmt.Printf("Listening stopped: %s\n", err)
 		}
 		<-shutdownChan
 	}

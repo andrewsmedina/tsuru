@@ -23,6 +23,7 @@ import (
 	"github.com/tsuru/tsuru/quota"
 	"github.com/tsuru/tsuru/repository"
 	"github.com/tsuru/tsuru/repository/repositorytest"
+	"github.com/tsuru/tsuru/router/routertest"
 	"github.com/tsuru/tsuru/service"
 	"gopkg.in/check.v1"
 )
@@ -89,10 +90,20 @@ func (s *S) createUserAndTeam(c *check.C) {
 var nativeScheme = auth.ManagedScheme(native.NativeScheme{})
 
 func (s *S) SetUpSuite(c *check.C) {
-	repositorytest.Reset()
 	err := config.ReadConfigFile("testdata/config.yaml")
+	c.Assert(err, check.IsNil)
+	config.Set("database:url", "127.0.0.1:27017")
+	config.Set("database:name", "tsuru_api_base_test")
+	app.LogPubSubQueuePrefix = "pubsub:api-base-test:"
+}
+
+func (s *S) SetUpTest(c *check.C) {
+	routertest.FakeRouter.Reset()
+	repositorytest.Reset()
+	var err error
 	s.conn, err = db.Conn()
 	c.Assert(err, check.IsNil)
+	dbtest.ClearAllCollections(s.conn.Apps().Database)
 	s.logConn, err = db.LogConn()
 	c.Assert(err, check.IsNil)
 	s.createUserAndTeam(c)
@@ -102,19 +113,9 @@ func (s *S) SetUpSuite(c *check.C) {
 	p := app.Platform{Name: "zend"}
 	s.conn.Platforms().Insert(p)
 	s.Pool = "test1"
-	err = provision.AddPool("test1")
+	opts := provision.AddPoolOptions{Name: "test1", Default: true}
+	err = provision.AddPool(opts)
 	c.Assert(err, check.IsNil)
-}
-
-func (s *S) TearDownSuite(c *check.C) {
-	provision.RemovePool("test1")
-	dbtest.ClearAllCollections(s.conn.Apps().Database)
-	s.conn.Close()
-	s.logConn.Close()
-}
-
-func (s *S) SetUpTest(c *check.C) {
-	repositorytest.Reset()
 	repository.Manager().CreateUser(s.user.Email)
 	repository.Manager().CreateUser(s.adminuser.Email)
 	factory, err := queue.Factory()
@@ -124,6 +125,8 @@ func (s *S) SetUpTest(c *check.C) {
 
 func (s *S) TearDownTest(c *check.C) {
 	s.provisioner.Reset()
+	s.conn.Close()
+	s.logConn.Close()
 	context.Purge(-1)
 }
 

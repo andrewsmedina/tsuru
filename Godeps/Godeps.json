@@ -1,18 +1,62 @@
 {
 	"ImportPath": "github.com/tsuru/tsuru",
-	"GoVersion": "devel +1b4025f Fri Apr 24 20:10:14 2015 +0000",
+	"GoVersion": "go1.4.2",
 	"Packages": [
 		"./..."
 	],
 	"Deps": [
 		{
-			"ImportPath": "github.com/Sirupsen/logrus",
-			"Comment": "v0.5.1-37-g6ebb4e7",
-			"Rev": "6ebb4e7b3c24b9fef150d7693e728cb1ebadf1f5"
+			"ImportPath": "github.com/aws/aws-sdk-go/aws",
+			"Comment": "v0.9.1rc2",
+			"Rev": "a11ddd7a070196035bc94b6c04a2a0114c06a395"
+		},
+		{
+			"ImportPath": "github.com/aws/aws-sdk-go/internal/endpoints",
+			"Comment": "v0.9.1rc2",
+			"Rev": "a11ddd7a070196035bc94b6c04a2a0114c06a395"
+		},
+		{
+			"ImportPath": "github.com/aws/aws-sdk-go/internal/protocol/ec2query",
+			"Comment": "v0.9.1rc2",
+			"Rev": "a11ddd7a070196035bc94b6c04a2a0114c06a395"
+		},
+		{
+			"ImportPath": "github.com/aws/aws-sdk-go/internal/protocol/query/queryutil",
+			"Comment": "v0.9.1rc2",
+			"Rev": "a11ddd7a070196035bc94b6c04a2a0114c06a395"
+		},
+		{
+			"ImportPath": "github.com/aws/aws-sdk-go/internal/protocol/rest",
+			"Comment": "v0.9.1rc2",
+			"Rev": "a11ddd7a070196035bc94b6c04a2a0114c06a395"
+		},
+		{
+			"ImportPath": "github.com/aws/aws-sdk-go/internal/protocol/xml/xmlutil",
+			"Comment": "v0.9.1rc2",
+			"Rev": "a11ddd7a070196035bc94b6c04a2a0114c06a395"
+		},
+		{
+			"ImportPath": "github.com/aws/aws-sdk-go/internal/signer/v4",
+			"Comment": "v0.9.1rc2",
+			"Rev": "a11ddd7a070196035bc94b6c04a2a0114c06a395"
+		},
+		{
+			"ImportPath": "github.com/aws/aws-sdk-go/service/ec2",
+			"Comment": "v0.9.1rc2",
+			"Rev": "a11ddd7a070196035bc94b6c04a2a0114c06a395"
 		},
 		{
 			"ImportPath": "github.com/bradfitz/go-smtpd/smtpd",
 			"Rev": "5b56f4f917c7f54e3822b9c64df54da596b63c1d"
+		},
+		{
+			"ImportPath": "github.com/codahale/hdrhistogram",
+			"Rev": "5fd85ec0b4e2dd5d4158d257d943f2e586d86b62"
+		},
+		{
+			"ImportPath": "github.com/codegangsta/cli",
+			"Comment": "1.2.0-62-gbf4a526",
+			"Rev": "bf4a526f48af7badd25d2cb02d587e1b01be3b50"
 		},
 		{
 			"ImportPath": "github.com/codegangsta/negroni",
@@ -20,43 +64,8 @@
 			"Rev": "a13766a8c2572caeb14341b7de158aff2fd00fa9"
 		},
 		{
-			"ImportPath": "github.com/docker/docker/pkg/archive",
-			"Comment": "v1.3.0-221-g29ebb53",
-			"Rev": "3c77e7d63446f0e0b133010fb3731af5556628bb"
-		},
-		{
-			"ImportPath": "github.com/docker/docker/pkg/fileutils",
-			"Comment": "v1.3.0-221-g29ebb53",
-			"Rev": "3c77e7d63446f0e0b133010fb3731af5556628bb"
-		},
-		{
-			"ImportPath": "github.com/docker/docker/pkg/ioutils",
-			"Comment": "v1.3.0-221-g29ebb53",
-			"Rev": "3c77e7d63446f0e0b133010fb3731af5556628bb"
-		},
-		{
-			"ImportPath": "github.com/docker/docker/pkg/pools",
-			"Comment": "v1.3.0-221-g29ebb53",
-			"Rev": "3c77e7d63446f0e0b133010fb3731af5556628bb"
-		},
-		{
-			"ImportPath": "github.com/docker/docker/pkg/promise",
-			"Comment": "v1.3.0-221-g29ebb53",
-			"Rev": "3c77e7d63446f0e0b133010fb3731af5556628bb"
-		},
-		{
-			"ImportPath": "github.com/docker/docker/pkg/system",
-			"Comment": "v1.3.0-221-g29ebb53",
-			"Rev": "3c77e7d63446f0e0b133010fb3731af5556628bb"
-		},
-		{
-			"ImportPath": "github.com/docker/docker/vendor/src/code.google.com/p/go/src/pkg/archive/tar",
-			"Comment": "v1.3.0-221-g29ebb53",
-			"Rev": "3c77e7d63446f0e0b133010fb3731af5556628bb"
-		},
-		{
 			"ImportPath": "github.com/fsouza/go-dockerclient",
-			"Rev": "c332531533b35d97daf64f9179f84442b90649d8"
+			"Rev": "76517a150efda701fdef6e5780a55977c269b623"
 		},
 		{
 			"ImportPath": "github.com/garyburd/redigo/redis",
@@ -80,45 +89,166 @@
 			"Rev": "5102fde921d31f59c6e45d835aa01f0213aade0f"
 		},
 		{
+			"ImportPath": "github.com/mailgun/go-etcd/etcd",
+			"Comment": "v0.2.0-rc1-124-g248e96a",
+			"Rev": "248e96a4ad7adfa23b531eb2d8e80d9050c33d24"
+		},
+		{
+			"ImportPath": "github.com/mailgun/iptools",
+			"Rev": "5349e5b95891ef5cb63ed867c31c5204cae280b2"
+		},
+		{
+			"ImportPath": "github.com/mailgun/log",
+			"Rev": "5aaa76573581bbbc327dbf69c11527aef7f085c2"
+		},
+		{
+			"ImportPath": "github.com/mailgun/manners",
+			"Comment": "0.3.1-24-g8518c51",
+			"Rev": "8518c51825e4aec9d3de17203b2b409dd0c5e5c5"
+		},
+		{
+			"ImportPath": "github.com/mailgun/metrics",
+			"Rev": "2b3c4565aafdcd40c8069e50de08ac5379787943"
+		},
+		{
+			"ImportPath": "github.com/mailgun/minheap",
+			"Rev": "7c28d80e2ada649fc8ab1a37b86d30a2633bd47c"
+		},
+		{
+			"ImportPath": "github.com/mailgun/multibuf",
+			"Rev": "b9c925d6897fbd77f37297856349caa254ca3cc7"
+		},
+		{
+			"ImportPath": "github.com/mailgun/oxy/cbreaker",
+			"Rev": "16f684286b383da3704425dacf83ecaeb6f1d7be"
+		},
+		{
+			"ImportPath": "github.com/mailgun/oxy/connlimit",
+			"Rev": "16f684286b383da3704425dacf83ecaeb6f1d7be"
+		},
+		{
+			"ImportPath": "github.com/mailgun/oxy/forward",
+			"Rev": "16f684286b383da3704425dacf83ecaeb6f1d7be"
+		},
+		{
+			"ImportPath": "github.com/mailgun/oxy/memmetrics",
+			"Rev": "16f684286b383da3704425dacf83ecaeb6f1d7be"
+		},
+		{
+			"ImportPath": "github.com/mailgun/oxy/ratelimit",
+			"Rev": "16f684286b383da3704425dacf83ecaeb6f1d7be"
+		},
+		{
+			"ImportPath": "github.com/mailgun/oxy/roundrobin",
+			"Rev": "16f684286b383da3704425dacf83ecaeb6f1d7be"
+		},
+		{
+			"ImportPath": "github.com/mailgun/oxy/stream",
+			"Rev": "16f684286b383da3704425dacf83ecaeb6f1d7be"
+		},
+		{
+			"ImportPath": "github.com/mailgun/oxy/trace",
+			"Rev": "16f684286b383da3704425dacf83ecaeb6f1d7be"
+		},
+		{
+			"ImportPath": "github.com/mailgun/oxy/utils",
+			"Rev": "16f684286b383da3704425dacf83ecaeb6f1d7be"
+		},
+		{
+			"ImportPath": "github.com/mailgun/predicate",
+			"Rev": "cb0bff91a7ab7cf7571e661ff883fc997bc554a3"
+		},
+		{
+			"ImportPath": "github.com/mailgun/route",
+			"Rev": "87a5c4a010f9f56d91579c86fc74351c8af92b2d"
+		},
+		{
+			"ImportPath": "github.com/mailgun/scroll",
+			"Rev": "bbfcfdfe60d60fcc4b8fcbf6974226672cc8638f"
+		},
+		{
+			"ImportPath": "github.com/mailgun/timetools",
+			"Rev": "fd192d755b00c968d312d23f521eb0cdc6f66bd0"
+		},
+		{
+			"ImportPath": "github.com/mailgun/ttlmap",
+			"Rev": "51994f8e1aad271eb214e725379dde8bd4c90acf"
+		},
+		{
+			"ImportPath": "github.com/mailgun/vulcand/anomaly",
+			"Comment": "v0.8.0-beta.3-15-g22a71f6",
+			"Rev": "22a71f6b1f6eb0b2be35aaaeadabf2a8ed8c4bc2"
+		},
+		{
+			"ImportPath": "github.com/mailgun/vulcand/api",
+			"Comment": "v0.8.0-beta.3-15-g22a71f6",
+			"Rev": "22a71f6b1f6eb0b2be35aaaeadabf2a8ed8c4bc2"
+		},
+		{
+			"ImportPath": "github.com/mailgun/vulcand/engine",
+			"Comment": "v0.8.0-beta.3-15-g22a71f6",
+			"Rev": "22a71f6b1f6eb0b2be35aaaeadabf2a8ed8c4bc2"
+		},
+		{
+			"ImportPath": "github.com/mailgun/vulcand/plugin",
+			"Comment": "v0.8.0-beta.3-15-g22a71f6",
+			"Rev": "22a71f6b1f6eb0b2be35aaaeadabf2a8ed8c4bc2"
+		},
+		{
+			"ImportPath": "github.com/mailgun/vulcand/proxy",
+			"Comment": "v0.8.0-beta.3-15-g22a71f6",
+			"Rev": "22a71f6b1f6eb0b2be35aaaeadabf2a8ed8c4bc2"
+		},
+		{
+			"ImportPath": "github.com/mailgun/vulcand/stapler",
+			"Comment": "v0.8.0-beta.3-15-g22a71f6",
+			"Rev": "22a71f6b1f6eb0b2be35aaaeadabf2a8ed8c4bc2"
+		},
+		{
+			"ImportPath": "github.com/mailgun/vulcand/supervisor",
+			"Comment": "v0.8.0-beta.3-15-g22a71f6",
+			"Rev": "22a71f6b1f6eb0b2be35aaaeadabf2a8ed8c4bc2"
+		},
+		{
 			"ImportPath": "github.com/sajari/fuzzy",
 			"Rev": "bbbcac964e38148a7b43491a83d83b6b584600dc"
 		},
 		{
 			"ImportPath": "github.com/tsuru/commandmocker",
-			"Rev": "adc1ee2fa7604e1663b2564ca1283d71c9153cac"
+			"Rev": "be4aec17ebc7264c791bf01709bfd956475d2ee8"
 		},
 		{
 			"ImportPath": "github.com/tsuru/config",
-			"Rev": "1fb3132fcee97c39e8894cb8aa8e90abdeaf98c7"
+			"Rev": "42a6c79d5b2c27b9d54cf1c5c28379adc9a7e846"
 		},
 		{
 			"ImportPath": "github.com/tsuru/docker-cluster/cluster",
-			"Rev": "7df15c83c49b5f9bf4ee15eefd56d6108ee29ea7"
+			"Rev": "e2d37cd61e79a575738198f5df690df7d8c13f46"
 		},
 		{
 			"ImportPath": "github.com/tsuru/docker-cluster/log",
-			"Rev": "7df15c83c49b5f9bf4ee15eefd56d6108ee29ea7"
+			"Rev": "e2d37cd61e79a575738198f5df690df7d8c13f46"
 		},
 		{
 			"ImportPath": "github.com/tsuru/docker-cluster/storage",
-			"Rev": "7df15c83c49b5f9bf4ee15eefd56d6108ee29ea7"
+			"Rev": "e2d37cd61e79a575738198f5df690df7d8c13f46"
 		},
 		{
 			"ImportPath": "github.com/tsuru/gandalf/gandalftest",
-			"Comment": "0.5.2-65-gd03ccdf",
-			"Rev": "d03ccdf91802f43ce19191737850e8755fed227e"
+			"Comment": "0.7.1-2-g370638b",
+			"Rev": "370638bac9491a68b8f8c11f4099b609756beb85"
 		},
 		{
 			"ImportPath": "github.com/tsuru/go-gandalfclient",
-			"Rev": "9b0fbf563d852fb9356b38fe972b893be4674a24"
+			"Rev": "6f5a04eb8172e1380ca09d426e67a07687828b7a"
 		},
 		{
 			"ImportPath": "github.com/tsuru/monsterqueue",
-			"Rev": "f741e61a6c0c428ebf36ccad904c21bfdebd299c"
+			"Rev": "c2240c7d35e400a0ba96b1c634089e39f5705db5"
 		},
 		{
-			"ImportPath": "github.com/tsuru/monsterqueue/mongodb",
-			"Rev": "f741e61a6c0c428ebf36ccad904c21bfdebd299c"
+			"ImportPath": "github.com/vaughan0/go-ini",
+			"Rev": "a98ad7ee00ec53921f08832bc06ecf7fd600e6a1"
 		},
 		{
 			"ImportPath": "golang.org/x/crypto/bcrypt",
@@ -126,6 +256,10 @@
 		},
 		{
 			"ImportPath": "golang.org/x/crypto/blowfish",
+			"Rev": "1fbbd62cfec66bd39d91e97749579579d4d3037e"
+		},
+		{
+			"ImportPath": "golang.org/x/crypto/ocsp",
 			"Rev": "1fbbd62cfec66bd39d91e97749579579d4d3037e"
 		},
 		{
@@ -138,6 +272,10 @@
 		},
 		{
 			"ImportPath": "golang.org/x/net/netutil",
+			"Rev": "6dc0abcce25682504770fa9a7a6705bbfdebfa48"
+		},
+		{
+			"ImportPath": "golang.org/x/net/websocket",
 			"Rev": "6dc0abcce25682504770fa9a7a6705bbfdebfa48"
 		},
 		{

@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/tsuru/docker-cluster/cluster"
+	"github.com/tsuru/monsterqueue"
 	"github.com/tsuru/tsuru/api"
 	"github.com/tsuru/tsuru/auth"
 	"github.com/tsuru/tsuru/errors"
@@ -22,6 +23,9 @@ import (
 	_ "github.com/tsuru/tsuru/iaas/cloudstack"
 	_ "github.com/tsuru/tsuru/iaas/ec2"
 	tsuruIo "github.com/tsuru/tsuru/io"
+	"github.com/tsuru/tsuru/provision/docker/bs"
+	"github.com/tsuru/tsuru/provision/docker/healer"
+	"github.com/tsuru/tsuru/queue"
 	"gopkg.in/mgo.v2"
 )
 
@@ -38,7 +42,46 @@ func init() {
 	api.RegisterHandler("/docker/fix-containers", "POST", api.AdminRequiredHandler(fixContainersHandler))
 	api.RegisterHandler("/docker/healing", "GET", api.AdminRequiredHandler(healingHistoryHandler))
 	api.RegisterHandler("/docker/autoscale", "GET", api.AdminRequiredHandler(autoScaleHistoryHandler))
+	api.RegisterHandler("/docker/autoscale/config", "GET", api.AdminRequiredHandler(autoScaleGetConfig))
 	api.RegisterHandler("/docker/autoscale/run", "POST", api.AdminRequiredHandler(autoScaleRunHandler))
+	api.RegisterHandler("/docker/autoscale/rules", "GET", api.AdminRequiredHandler(autoScaleListRules))
+	api.RegisterHandler("/docker/autoscale/rules", "POST", api.AdminRequiredHandler(autoScaleSetRule))
+	api.RegisterHandler("/docker/autoscale/rules/", "DELETE", api.AdminRequiredHandler(autoScaleDeleteRule))
+	api.RegisterHandler("/docker/autoscale/rules/{id}", "DELETE", api.AdminRequiredHandler(autoScaleDeleteRule))
+	api.RegisterHandler("/docker/bs/upgrade", "POST", api.AdminRequiredHandler(bsUpgradeHandler))
+	api.RegisterHandler("/docker/bs/env", "POST", api.AdminRequiredHandler(bsEnvSetHandler))
+	api.RegisterHandler("/docker/bs", "GET", api.AdminRequiredHandler(bsConfigGetHandler))
+}
+
+func autoScaleGetConfig(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	config := mainDockerProvisioner.initAutoScaleConfig()
+	return json.NewEncoder(w).Encode(config)
+}
+
+func autoScaleListRules(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	rules, err := listAutoScaleRules()
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(w).Encode(&rules)
+}
+
+func autoScaleSetRule(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	var rule autoScaleRule
+	err := json.NewDecoder(r.Body).Decode(&rule)
+	if err != nil {
+		return err
+	}
+	return rule.update()
+}
+
+func autoScaleDeleteRule(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	ruleID := r.URL.Query().Get(":id")
+	err := deleteAutoScaleRule(ruleID)
+	if err == mgo.ErrNotFound {
+		return &errors.HTTP{Code: http.StatusNotFound, Message: "rule not found"}
+	}
+	return nil
 }
 
 func validateNodeAddress(address string) error {
@@ -60,6 +103,7 @@ func validateNodeAddress(address string) error {
 
 func (p *dockerProvisioner) addNodeForParams(params map[string]string, isRegister bool) (map[string]string, error) {
 	response := make(map[string]string)
+	var machineID string
 	var address string
 	if isRegister {
 		address, _ = params["address"]
@@ -72,15 +116,23 @@ func (p *dockerProvisioner) addNodeForParams(params map[string]string, isRegiste
 			return response, err
 		}
 		address = m.FormatNodeAddress()
+		machineID = m.Id
 	}
 	err := validateNodeAddress(address)
 	if err != nil {
 		return response, err
 	}
-	_, err = p.getCluster().Register(address, params)
+	node := cluster.Node{Address: address, Metadata: params, CreationStatus: cluster.NodeCreationStatusPending}
+	err = p.Cluster().Register(node)
 	if err != nil {
 		return response, err
 	}
+	q, err := queue.Queue()
+	if err != nil {
+		return response, err
+	}
+	jobParams := monsterqueue.JobParams{"endpoint": address, "machine": machineID, "metadata": params}
+	_, err = q.Enqueue(bs.QueueTaskName, jobParams)
 	return response, err
 }
 
@@ -111,7 +163,7 @@ func removeNodeHandler(w http.ResponseWriter, r *http.Request, t auth.Token) err
 	if address == "" {
 		return fmt.Errorf("Node address is required.")
 	}
-	nodes, err := mainDockerProvisioner.getCluster().UnfilteredNodes()
+	nodes, err := mainDockerProvisioner.Cluster().UnfilteredNodes()
 	if err != nil {
 		return err
 	}
@@ -125,7 +177,7 @@ func removeNodeHandler(w http.ResponseWriter, r *http.Request, t auth.Token) err
 	if node == nil {
 		return fmt.Errorf("node with address %q not found in cluster", address)
 	}
-	err = mainDockerProvisioner.getCluster().Unregister(address)
+	err = mainDockerProvisioner.Cluster().Unregister(address)
 	if err != nil {
 		return err
 	}
@@ -137,12 +189,16 @@ func removeNodeHandler(w http.ResponseWriter, r *http.Request, t auth.Token) err
 		}
 		return m.Destroy()
 	}
+	noRebalance, err := strconv.ParseBool(r.URL.Query().Get("no-rebalance"))
+	if !noRebalance {
+		return mainDockerProvisioner.rebalanceContainersByHost(urlToHost(address), w)
+	}
 	return nil
 }
 
 //listNodeHandler call scheduler.Nodes to list all nodes into it.
 func listNodeHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
-	nodeList, err := mainDockerProvisioner.getCluster().UnfilteredNodes()
+	nodeList, err := mainDockerProvisioner.Cluster().UnfilteredNodes()
 	if err != nil {
 		return err
 	}
@@ -167,7 +223,12 @@ func updateNodeHandler(w http.ResponseWriter, r *http.Request, t auth.Token) err
 		return &errors.HTTP{Code: http.StatusBadRequest, Message: "address is required"}
 	}
 	delete(params, "address")
-	_, err = mainDockerProvisioner.getCluster().UpdateNode(address, params)
+	node := cluster.Node{Address: address, Metadata: params}
+	disabled, _ := strconv.ParseBool(r.URL.Query().Get("disabled"))
+	if disabled {
+		node.CreationStatus = cluster.NodeCreationStatusDisabled
+	}
+	_, err = mainDockerProvisioner.Cluster().UpdateNode(node)
 	return err
 }
 
@@ -215,7 +276,7 @@ func moveContainersHandler(w http.ResponseWriter, r *http.Request, t auth.Token)
 	writer := &tsuruIo.SimpleJsonMessageEncoderWriter{
 		Encoder: json.NewEncoder(w),
 	}
-	err = mainDockerProvisioner.moveContainers(from, to, writer)
+	err = mainDockerProvisioner.MoveContainers(from, to, writer)
 	if err != nil {
 		fmt.Fprintf(writer, "Error trying to move containers: %s\n", err.Error())
 	} else {
@@ -286,7 +347,7 @@ func healingHistoryHandler(w http.ResponseWriter, r *http.Request, t auth.Token)
 			Message: "invalid filter, possible values are 'node' or 'container'",
 		}
 	}
-	history, err := listHealingHistory(filter)
+	history, err := healer.ListHealingHistory(filter)
 	if err != nil {
 		return err
 	}
@@ -315,5 +376,73 @@ func autoScaleRunHandler(w http.ResponseWriter, r *http.Request, t auth.Token) e
 	if err != nil {
 		writer.Encoder.Encode(tsuruIo.SimpleJsonMessage{Error: err.Error()})
 	}
+	return nil
+}
+
+func bsEnvSetHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	var requestConfig bs.Config
+	err := json.NewDecoder(r.Body).Decode(&requestConfig)
+	if err != nil {
+		return &errors.HTTP{
+			Code:    http.StatusBadRequest,
+			Message: fmt.Sprintf("unable to parse body as json: %s", err),
+		}
+	}
+	currentConfig, err := bs.LoadConfig()
+	if err != nil {
+		if err != mgo.ErrNotFound {
+			return err
+		}
+		currentConfig = &bs.Config{}
+	}
+	envMap := bs.EnvMap{}
+	poolEnvMap := bs.PoolEnvMap{}
+	err = currentConfig.UpdateEnvMaps(envMap, poolEnvMap)
+	if err != nil {
+		return &errors.HTTP{
+			Code:    http.StatusBadRequest,
+			Message: err.Error(),
+		}
+	}
+	err = requestConfig.UpdateEnvMaps(envMap, poolEnvMap)
+	if err != nil {
+		return &errors.HTTP{
+			Code:    http.StatusBadRequest,
+			Message: err.Error(),
+		}
+	}
+	err = bs.SaveEnvs(envMap, poolEnvMap)
+	if err != nil {
+		return err
+	}
+	err = bs.RecreateContainers(mainDockerProvisioner)
+	if err != nil {
+		return err
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+func bsConfigGetHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	currentConfig, err := bs.LoadConfig()
+	if err != nil {
+		if err != mgo.ErrNotFound {
+			return err
+		}
+		currentConfig = &bs.Config{}
+	}
+	return json.NewEncoder(w).Encode(currentConfig)
+}
+
+func bsUpgradeHandler(w http.ResponseWriter, r *http.Request, t auth.Token) error {
+	err := bs.SaveImage("")
+	if err != nil {
+		return err
+	}
+	err = bs.RecreateContainers(mainDockerProvisioner)
+	if err != nil {
+		return err
+	}
+	w.WriteHeader(http.StatusNoContent)
 	return nil
 }

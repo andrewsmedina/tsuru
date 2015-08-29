@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -89,15 +90,27 @@ func (a *addNodeToSchedulerCmd) Flags() *gnuflag.FlagSet {
 	return a.fs
 }
 
-type updateNodeToSchedulerCmd struct{}
+type updateNodeToSchedulerCmd struct {
+	fs       *gnuflag.FlagSet
+	disabled bool
+}
 
 func (updateNodeToSchedulerCmd) Info() *cmd.Info {
 	return &cmd.Info{
-		Name:    "docker-node-update",
-		Usage:   "docker-node-update <address> [param_name=param_value...]",
-		Desc:    `Modifies metadata associated to a docker node.`,
+		Name:  "docker-node-update",
+		Usage: "docker-node-update <address> [param_name=param_value...] --disable",
+		Desc: `Modifies metadata associated to a docker node.
+--disable: Disable node in scheduler.`,
 		MinArgs: 2,
 	}
+}
+
+func (a *updateNodeToSchedulerCmd) Flags() *gnuflag.FlagSet {
+	if a.fs == nil {
+		a.fs = gnuflag.NewFlagSet("", gnuflag.ExitOnError)
+		a.fs.BoolVar(&a.disabled, "disable", false, "Disable node in scheduler.")
+	}
+	return a.fs
 }
 
 func (a *updateNodeToSchedulerCmd) Run(ctx *cmd.Context, client *cmd.Client) error {
@@ -113,7 +126,7 @@ func (a *updateNodeToSchedulerCmd) Run(ctx *cmd.Context, client *cmd.Client) err
 	if err != nil {
 		return err
 	}
-	url, err := cmd.GetURL(fmt.Sprintf("/docker/node"))
+	url, err := cmd.GetURL(fmt.Sprintf("/docker/node?disabled=%t", a.disabled))
 	if err != nil {
 		return err
 	}
@@ -131,17 +144,19 @@ func (a *updateNodeToSchedulerCmd) Run(ctx *cmd.Context, client *cmd.Client) err
 
 type removeNodeFromSchedulerCmd struct {
 	cmd.ConfirmationCommand
-	fs      *gnuflag.FlagSet
-	destroy bool
+	fs          *gnuflag.FlagSet
+	destroy     bool
+	noRebalance bool
 }
 
 func (removeNodeFromSchedulerCmd) Info() *cmd.Info {
 	return &cmd.Info{
 		Name:  "docker-node-remove",
-		Usage: "docker-node-remove <address> [--destroy] [-y]",
+		Usage: "docker-node-remove <address> [--no-rebalance] [--destroy] [-y]",
 		Desc: `Removes a node from the cluster.
 
 --destroy: Destroy the machine in the IaaS used to create it, if it exists.
+--no-rebalance: Do not rebalance containers of removed node.
 `,
 		MinArgs: 1,
 	}
@@ -163,7 +178,7 @@ func (c *removeNodeFromSchedulerCmd) Run(ctx *cmd.Context, client *cmd.Client) e
 	if err != nil {
 		return err
 	}
-	url, err := cmd.GetURL("/docker/node")
+	url, err := cmd.GetURL(fmt.Sprintf("/docker/node?no-rebalance=%t", c.noRebalance))
 	if err != nil {
 		return err
 	}
@@ -183,6 +198,7 @@ func (c *removeNodeFromSchedulerCmd) Flags() *gnuflag.FlagSet {
 	if c.fs == nil {
 		c.fs = c.ConfirmationCommand.Flags()
 		c.fs.BoolVar(&c.destroy, "destroy", false, "Destroy node from IaaS")
+		c.fs.BoolVar(&c.noRebalance, "no-rebalance", false, "Do not rebalance containers of removed node.")
 	}
 	return c.fs
 }
@@ -280,100 +296,6 @@ func (c *listNodesInTheSchedulerCmd) Run(ctx *cmd.Context, client *cmd.Client) e
 	return nil
 }
 
-type listHealingHistoryCmd struct {
-	fs            *gnuflag.FlagSet
-	nodeOnly      bool
-	containerOnly bool
-}
-
-func (c *listHealingHistoryCmd) Info() *cmd.Info {
-	return &cmd.Info{
-		Name:  "docker-healing-list",
-		Usage: "docker-healing-list [--node] [--container]",
-		Desc:  "List healing history for nodes or containers.",
-	}
-}
-
-func renderHistoryTable(history []healingEvent, filter string, ctx *cmd.Context) {
-	fmt.Fprintln(ctx.Stdout, strings.ToUpper(filter[:1])+filter[1:]+":")
-	headers := cmd.Row([]string{"Start", "Finish", "Success", "Failing", "Created", "Error"})
-	t := cmd.Table{Headers: headers}
-	for i := len(history) - 1; i >= 0; i-- {
-		event := history[i]
-		if event.Action != filter+"-healing" {
-			continue
-		}
-		data := make([]string, 2)
-		if filter == "node" {
-			data[0] = event.FailingNode.Address
-			data[1] = event.CreatedNode.Address
-		} else {
-			data[0] = event.FailingContainer.ID
-			data[1] = event.CreatedContainer.ID
-			if len(data[0]) > 10 {
-				data[0] = data[0][:10]
-			}
-			if len(data[1]) > 10 {
-				data[1] = data[1][:10]
-			}
-		}
-		t.AddRow(cmd.Row([]string{
-			event.StartTime.Local().Format(time.Stamp),
-			event.EndTime.Local().Format(time.Stamp),
-			fmt.Sprintf("%t", event.Successful),
-			data[0],
-			data[1],
-			event.Error,
-		}))
-	}
-	t.LineSeparator = true
-	ctx.Stdout.Write(t.Bytes())
-}
-
-func (c *listHealingHistoryCmd) Run(ctx *cmd.Context, client *cmd.Client) error {
-	var filter string
-	if c.nodeOnly && !c.containerOnly {
-		filter = "node"
-	}
-	if c.containerOnly && !c.nodeOnly {
-		filter = "container"
-	}
-	url, err := cmd.GetURL(fmt.Sprintf("/docker/healing?filter=%s", filter))
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	var history []healingEvent
-	err = json.NewDecoder(resp.Body).Decode(&history)
-	if err != nil {
-		return err
-	}
-	if filter != "" {
-		renderHistoryTable(history, filter, ctx)
-	} else {
-		renderHistoryTable(history, "node", ctx)
-		renderHistoryTable(history, "container", ctx)
-	}
-	return nil
-}
-
-func (c *listHealingHistoryCmd) Flags() *gnuflag.FlagSet {
-	if c.fs == nil {
-		c.fs = gnuflag.NewFlagSet("with-flags", gnuflag.ContinueOnError)
-		c.fs.BoolVar(&c.nodeOnly, "node", false, "List only healing process started for nodes")
-		c.fs.BoolVar(&c.containerOnly, "container", false, "List only healing process started for containers")
-	}
-	return c.fs
-}
-
 type listAutoScaleHistoryCmd struct {
 	fs   *gnuflag.FlagSet
 	page int
@@ -413,7 +335,8 @@ func (c *listAutoScaleHistoryCmd) Run(ctx *cmd.Context, client *cmd.Client) erro
 	}
 	headers := cmd.Row([]string{"Start", "Finish", "Success", "Metadata", "Action", "Reason", "Error"})
 	t := cmd.Table{Headers: headers}
-	for _, event := range history {
+	for i := range history {
+		event := &history[i]
 		t.AddRow(cmd.Row([]string{
 			event.StartTime.Local().Format(time.Stamp),
 			event.EndTime.Local().Format(time.Stamp),
@@ -438,11 +361,11 @@ func (c *listAutoScaleHistoryCmd) Flags() *gnuflag.FlagSet {
 	return c.fs
 }
 
-type listAutoScaleRunCmd struct {
+type autoScaleRunCmd struct {
 	cmd.ConfirmationCommand
 }
 
-func (c *listAutoScaleRunCmd) Info() *cmd.Info {
+func (c *autoScaleRunCmd) Info() *cmd.Info {
 	return &cmd.Info{
 		Name:  "docker-autoscale-run",
 		Usage: "docker-autoscale-run [-y/--assume-yes]",
@@ -453,7 +376,7 @@ were created using an IaaS provider registered in tsuru.`,
 	}
 }
 
-func (c *listAutoScaleRunCmd) Run(context *cmd.Context, client *cmd.Client) error {
+func (c *autoScaleRunCmd) Run(context *cmd.Context, client *cmd.Client) error {
 	context.RawOutput()
 	if !c.Confirm(context, "Are you sure you want to run auto scaling checks?") {
 		return nil
@@ -480,5 +403,211 @@ func (c *listAutoScaleRunCmd) Run(context *cmd.Context, client *cmd.Client) erro
 	if len(unparsed) > 0 {
 		return fmt.Errorf("unparsed message error: %s", string(unparsed))
 	}
+	return nil
+}
+
+type autoScaleInfoCmd struct{}
+
+func (c *autoScaleInfoCmd) Info() *cmd.Info {
+	return &cmd.Info{
+		Name:  "docker-autoscale-info",
+		Usage: "docker-autoscale-info",
+		Desc: `Display the current configuration for tsuru autoscale,
+including the set of rules and the current metadata filter.
+
+The metadata filter is the value that defines which node metadata will be used
+to group autoscale rules. A common approach is to use the "pool" as the
+filter. Then autoscale can be configured for each matching rule value.`,
+	}
+}
+
+func (c *autoScaleInfoCmd) Run(context *cmd.Context, client *cmd.Client) error {
+	config, err := c.getAutoScaleConfig(client)
+	if err != nil {
+		return err
+	}
+	if !config.Enabled {
+		fmt.Fprintln(context.Stdout, "auto-scale is disabled")
+		return nil
+	}
+	rules, err := c.getAutoScaleRules(client)
+	if err != nil {
+		return err
+	}
+	return c.render(context, config, rules)
+}
+
+func (c *autoScaleInfoCmd) getAutoScaleConfig(client *cmd.Client) (*autoScaleConfig, error) {
+	url, err := cmd.GetURL("/docker/autoscale/config")
+	if err != nil {
+		return nil, err
+	}
+	request, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var config autoScaleConfig
+	err = json.NewDecoder(resp.Body).Decode(&config)
+	if err != nil {
+		return nil, err
+	}
+	return &config, nil
+}
+
+func (c *autoScaleInfoCmd) getAutoScaleRules(client *cmd.Client) ([]autoScaleRule, error) {
+	url, err := cmd.GetURL("/docker/autoscale/rules")
+	if err != nil {
+		return nil, err
+	}
+	request, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var rules []autoScaleRule
+	err = json.NewDecoder(resp.Body).Decode(&rules)
+	if err != nil {
+		return nil, err
+	}
+	return rules, nil
+}
+
+func (c *autoScaleInfoCmd) render(context *cmd.Context, config *autoScaleConfig, rules []autoScaleRule) error {
+	fmt.Fprintf(context.Stdout, "Metadata filter: %s\n\n", config.GroupByMetadata)
+	var table cmd.Table
+	tableHeader := []string{
+		"Filter value",
+		"Max container count",
+		"Max memory ratio",
+		"Scale down ratio",
+		"Rebalance on scale",
+		"Enabled",
+	}
+	table.Headers = tableHeader
+	for _, rule := range rules {
+		table.AddRow([]string{
+			rule.MetadataFilter,
+			strconv.Itoa(rule.MaxContainerCount),
+			strconv.FormatFloat(float64(rule.MaxMemoryRatio), 'f', 4, 32),
+			strconv.FormatFloat(float64(rule.ScaleDownRatio), 'f', 4, 32),
+			strconv.FormatBool(!rule.PreventRebalance),
+			strconv.FormatBool(rule.Enabled),
+		})
+	}
+	fmt.Fprintf(context.Stdout, "Rules:\n%s", table.String())
+	return nil
+}
+
+type autoScaleSetRuleCmd struct {
+	fs                *gnuflag.FlagSet
+	filterValue       string
+	maxContainerCount int
+	maxMemoryRatio    float64
+	scaleDownRatio    float64
+	rebalanceOnScale  bool
+	enabled           bool
+}
+
+func (c *autoScaleSetRuleCmd) Info() *cmd.Info {
+	return &cmd.Info{
+		Name:  "docker-autoscale-rule-set",
+		Usage: "docker-autoscale-rule-set [-f/--filter-value metadata-filter-value] [-c/--max-container-count 0] [-m/--max-memory-ratio 0.9] [-d/--scale-down-ratio 1.33] [-r/--rebalance-on-scale false] [-e/--enabled true]",
+		Desc:  "Creates or update an auto-scale rule. Using resources limitation (amount of container or memory usage).",
+	}
+}
+
+func (c *autoScaleSetRuleCmd) Run(context *cmd.Context, client *cmd.Client) error {
+	rule := autoScaleRule{
+		MetadataFilter:    c.filterValue,
+		MaxContainerCount: c.maxContainerCount,
+		MaxMemoryRatio:    float32(c.maxMemoryRatio),
+		ScaleDownRatio:    float32(c.scaleDownRatio),
+		PreventRebalance:  !c.rebalanceOnScale,
+		Enabled:           c.enabled,
+	}
+	data, err := json.Marshal(rule)
+	if err != nil {
+		return err
+	}
+	body := bytes.NewBuffer(data)
+	url, err := cmd.GetURL("/docker/autoscale/rules")
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", url, body)
+	if err != nil {
+		return err
+	}
+	_, err = client.Do(req)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(context.Stdout, "Rule successfully defined.")
+	return nil
+}
+
+func (c *autoScaleSetRuleCmd) Flags() *gnuflag.FlagSet {
+	if c.fs == nil {
+		c.fs = gnuflag.NewFlagSet("autoscale-rule-set", gnuflag.ExitOnError)
+		c.fs.StringVar(&c.filterValue, "filter-value", "", "The value of the metadata filter matching the rule. This is the unique identifier of the rule.")
+		c.fs.StringVar(&c.filterValue, "f", "", "The value of the metadata filter matching the rule. This is the unique identifier of the rule.")
+		c.fs.IntVar(&c.maxContainerCount, "max-container-count", 0, "The maximum amount of containers on every node. Might be zero, which means no maximum value. Whenever this value is reached, tsuru will trigger a new auto scale event.")
+		c.fs.IntVar(&c.maxContainerCount, "c", 0, "The maximum amount of containers on every node. Might be zero, which means no maximum value. Whenever this value is reached, tsuru will trigger a new auto scale event.")
+		c.fs.Float64Var(&c.maxMemoryRatio, "max-memory-ratio", .0, "The maximum memory usage per node. 0 means no limit, 1 means 100%. It is fine to use values greater than 1, which means that tsuru will overcommit memory in Docker nodes. Keep in mind that container count has higher precedence than memory ratio, so if --max-container-count is defined, the value of --max-memory-ratio will be ignored.")
+		c.fs.Float64Var(&c.maxMemoryRatio, "m", .0, "The maximum memory usage per node. 0 means no limit, 1 means 100%. It is fine to use values greater than 1, which means that tsuru will overcommit memory in Docker nodes. Keep in mind that container count has higher precedence than memory ratio, so if --max-container-count is defined, the value of --max-memory-ratio will be ignored.")
+		c.fs.Float64Var(&c.scaleDownRatio, "scale-down-ratio", 1.33, "The ratio for triggering an scale down event. The default value is 1.33, which mean that whenever it gets one third of the resource utilization (memory ratio or container count).")
+		c.fs.Float64Var(&c.scaleDownRatio, "d", 1.33, "The ratio for triggering an scale down event. The default value is 1.33, which mean that whenever it gets one third of the resource utilization (memory ratio or container count).")
+		c.fs.BoolVar(&c.rebalanceOnScale, "rebalance-on-scale", true, "A boolean flag indicating whether containers should be rebalanced after running an scale. The default behavior is to always rebalance the containers.")
+		c.fs.BoolVar(&c.rebalanceOnScale, "r", true, "A boolean flag indicating whether containers should be rebalanced after running an scale. The default behavior is to always rebalance the containers.")
+		c.fs.BoolVar(&c.enabled, "enabled", true, "A boolean flag indicating whether the rule should be enabled or disabled")
+		c.fs.BoolVar(&c.enabled, "e", true, "A boolean flag indicating whether the rule should be enabled or disabled")
+	}
+	return c.fs
+}
+
+type autoScaleDeleteRuleCmd struct {
+	cmd.ConfirmationCommand
+}
+
+func (c *autoScaleDeleteRuleCmd) Info() *cmd.Info {
+	return &cmd.Info{
+		Name:  "docker-autoscale-rule-remove",
+		Usage: "docker-autoscale-rule-remove [rule-name] [-y/--assume-yes]",
+		Desc:  `Removes an auto-scale rule. The name of the rule may be omited, which means "remove the default rule".`,
+	}
+}
+
+func (c *autoScaleDeleteRuleCmd) Run(context *cmd.Context, client *cmd.Client) error {
+	var rule string
+	confirmMsg := "Are you sure you want to remove the default rule?"
+	if len(context.Args) > 0 {
+		rule = context.Args[0]
+		confirmMsg = fmt.Sprintf("Are you sure you want to remove the rule %q?", rule)
+	}
+	if !c.Confirm(context, confirmMsg) {
+		return nil
+	}
+	url, err := cmd.GetURL("/docker/autoscale/rules/" + rule)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("DELETE", url, nil)
+	if err != nil {
+		return err
+	}
+	_, err = client.Do(req)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(context.Stdout, "Rule successfully removed.")
 	return nil
 }

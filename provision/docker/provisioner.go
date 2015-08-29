@@ -19,6 +19,7 @@ import (
 	"github.com/tsuru/config"
 	"github.com/tsuru/docker-cluster/cluster"
 	clusterLog "github.com/tsuru/docker-cluster/log"
+	"github.com/tsuru/tsuru/action"
 	"github.com/tsuru/tsuru/api/shutdown"
 	"github.com/tsuru/tsuru/app"
 	"github.com/tsuru/tsuru/cmd"
@@ -26,10 +27,14 @@ import (
 	"github.com/tsuru/tsuru/db/storage"
 	"github.com/tsuru/tsuru/log"
 	"github.com/tsuru/tsuru/provision"
+	"github.com/tsuru/tsuru/provision/docker/bs"
+	"github.com/tsuru/tsuru/provision/docker/container"
+	"github.com/tsuru/tsuru/provision/docker/healer"
 	"github.com/tsuru/tsuru/router"
 	_ "github.com/tsuru/tsuru/router/galeb"
 	_ "github.com/tsuru/tsuru/router/hipache"
 	_ "github.com/tsuru/tsuru/router/routertest"
+	_ "github.com/tsuru/tsuru/router/vulcand"
 	"gopkg.in/mgo.v2/bson"
 )
 
@@ -61,9 +66,11 @@ func (p *dockerProvisioner) initDockerCluster() error {
 	clusterLog.SetDebug(debug)
 	clusterLog.SetLogger(log.GetStdLogger())
 	var err error
-	p.storage, err = buildClusterStorage()
-	if err != nil {
-		return err
+	if p.storage == nil {
+		p.storage, err = buildClusterStorage()
+		if err != nil {
+			return err
+		}
 	}
 	if p.collectionName == "" {
 		name, err := config.GetString("docker:collection")
@@ -73,20 +80,21 @@ func (p *dockerProvisioner) initDockerCluster() error {
 		p.collectionName = name
 	}
 	var nodes []cluster.Node
-	totalMemoryMetadata, _ := config.GetString("docker:scheduler:total-memory-metadata")
+	TotalMemoryMetadata, _ := config.GetString("docker:scheduler:total-memory-metadata")
 	maxUsedMemory, _ := config.GetFloat("docker:scheduler:max-used-memory")
 	p.scheduler = &segregatedScheduler{
 		maxMemoryRatio:      float32(maxUsedMemory),
-		totalMemoryMetadata: totalMemoryMetadata,
+		TotalMemoryMetadata: TotalMemoryMetadata,
 		provisioner:         p,
 	}
 	p.cluster, err = cluster.New(p.scheduler, p.storage, nodes...)
 	if err != nil {
 		return err
 	}
+	p.cluster.Hook = &bs.ClusterHook{Provisioner: p}
 	autoHealingNodes, _ := config.GetBool("docker:healing:heal-nodes")
 	if autoHealingNodes {
-		disabledSeconds, _ := config.GetDuration("docker:healing:disabled-time")
+		disabledSeconds, _ := config.GetInt("docker:healing:disabled-time")
 		if disabledSeconds <= 0 {
 			disabledSeconds = 30
 		}
@@ -94,37 +102,36 @@ func (p *dockerProvisioner) initDockerCluster() error {
 		if maxFailures <= 0 {
 			maxFailures = 5
 		}
-		waitSecondsNewMachine, _ := config.GetDuration("docker:healing:wait-new-time")
+		waitSecondsNewMachine, _ := config.GetInt("docker:healing:wait-new-time")
 		if waitSecondsNewMachine <= 0 {
 			waitSecondsNewMachine = 5 * 60
 		}
-		healer := nodeHealer{
-			locks:                 make(map[string]*sync.Mutex),
-			provisioner:           p,
-			disabledTime:          disabledSeconds * time.Second,
-			waitTimeNewMachine:    waitSecondsNewMachine * time.Second,
-			failuresBeforeHealing: maxFailures,
-		}
-		shutdown.Register(&healer)
-		p.cluster.Healer = &healer
+		nodeHealer := healer.NewNodeHealer(healer.NodeHealerArgs{
+			Provisioner:           p,
+			DisabledTime:          time.Duration(disabledSeconds) * time.Second,
+			WaitTimeNewMachine:    time.Duration(waitSecondsNewMachine) * time.Second,
+			FailuresBeforeHealing: maxFailures,
+		})
+		shutdown.Register(nodeHealer)
+		p.cluster.Healer = nodeHealer
 	}
-	healContainersSeconds, _ := config.GetDuration("docker:healing:heal-containers-timeout")
+	healContainersSeconds, _ := config.GetInt("docker:healing:heal-containers-timeout")
 	if healContainersSeconds > 0 {
-		contHealerInst := containerHealer{
-			provisioner:         p,
-			maxUnresponsiveTime: healContainersSeconds * time.Second,
-			done:                make(chan bool),
-		}
-		shutdown.Register(&contHealerInst)
-		go contHealerInst.runContainerHealer()
+		contHealerInst := healer.NewContainerHealer(healer.ContainerHealerArgs{
+			Provisioner:         p,
+			MaxUnresponsiveTime: time.Duration(healContainersSeconds) * time.Second,
+			Done:                make(chan bool),
+			Locker:              &appLocker{},
+		})
+		shutdown.Register(contHealerInst)
+		go contHealerInst.RunContainerHealer()
 	}
-	activeMonitoring, _ := config.GetDuration("docker:healing:active-monitoring-interval")
+	activeMonitoring, _ := config.GetInt("docker:healing:active-monitoring-interval")
 	if activeMonitoring > 0 {
-		p.cluster.StartActiveMonitoring(activeMonitoring * time.Second)
+		p.cluster.StartActiveMonitoring(time.Duration(activeMonitoring) * time.Second)
 	}
-	autoScaleEnabled, _ := config.GetBool("docker:auto-scale:enabled")
-	if autoScaleEnabled {
-		autoScale := p.initAutoScaleConfig()
+	autoScale := p.initAutoScaleConfig()
+	if autoScale.Enabled {
 		shutdown.Register(autoScale)
 		go autoScale.run()
 	}
@@ -132,31 +139,23 @@ func (p *dockerProvisioner) initDockerCluster() error {
 }
 
 func (p *dockerProvisioner) initAutoScaleConfig() *autoScaleConfig {
-	waitSecondsNewMachine, _ := config.GetDuration("docker:auto-scale:wait-new-time")
-	groupByMetadata, _ := config.GetString("docker:auto-scale:group-by-metadata")
-	matadataFilter, _ := config.GetString("docker:auto-scale:metadata-filter")
-	maxContainerCount, _ := config.GetInt("docker:auto-scale:max-container-count")
-	runInterval, _ := config.GetDuration("docker:auto-scale:run-interval")
-	scaleDownRatio, _ := config.GetFloat("docker:auto-scale:scale-down-ratio")
-	preventRebalance, _ := config.GetBool("docker:auto-scale:prevent-rebalance")
-	totalMemoryMetadata, _ := config.GetString("docker:scheduler:total-memory-metadata")
-	maxUsedMemory, _ := config.GetFloat("docker:scheduler:max-used-memory")
+	enabled, _ := config.GetBool("docker:auto-scale:enabled")
+	waitSecondsNewMachine, _ := config.GetInt("docker:auto-scale:wait-new-time")
+	GroupByMetadata, _ := config.GetString("docker:auto-scale:group-by-metadata")
+	runInterval, _ := config.GetInt("docker:auto-scale:run-interval")
+	TotalMemoryMetadata, _ := config.GetString("docker:scheduler:total-memory-metadata")
 	return &autoScaleConfig{
+		GroupByMetadata:     GroupByMetadata,
+		TotalMemoryMetadata: TotalMemoryMetadata,
+		WaitTimeNewMachine:  time.Duration(waitSecondsNewMachine) * time.Second,
+		RunInterval:         time.Duration(runInterval) * time.Second,
+		Enabled:             enabled,
 		provisioner:         p,
-		groupByMetadata:     groupByMetadata,
-		totalMemoryMetadata: totalMemoryMetadata,
-		maxMemoryRatio:      float32(maxUsedMemory),
-		maxContainerCount:   maxContainerCount,
-		matadataFilter:      matadataFilter,
-		scaleDownRatio:      float32(scaleDownRatio),
-		waitTimeNewMachine:  waitSecondsNewMachine * time.Second,
-		runInterval:         runInterval * time.Second,
-		preventRebalance:    preventRebalance,
 		done:                make(chan bool),
 	}
 }
 
-func (p *dockerProvisioner) cloneProvisioner(ignoredContainers []container) (*dockerProvisioner, error) {
+func (p *dockerProvisioner) cloneProvisioner(ignoredContainers []container.Container) (*dockerProvisioner, error) {
 	var err error
 	overridenProvisioner := *p
 	containerIds := make([]string, len(ignoredContainers))
@@ -165,7 +164,7 @@ func (p *dockerProvisioner) cloneProvisioner(ignoredContainers []container) (*do
 	}
 	overridenProvisioner.scheduler = &segregatedScheduler{
 		maxMemoryRatio:      p.scheduler.maxMemoryRatio,
-		totalMemoryMetadata: p.scheduler.totalMemoryMetadata,
+		TotalMemoryMetadata: p.scheduler.TotalMemoryMetadata,
 		provisioner:         &overridenProvisioner,
 		ignoredContainers:   containerIds,
 	}
@@ -180,13 +179,13 @@ func (p *dockerProvisioner) cloneProvisioner(ignoredContainers []container) (*do
 func (p *dockerProvisioner) stopDryMode() {
 	if p.isDryMode {
 		p.cluster.StopDryMode()
-		coll := p.collection()
+		coll := p.Collection()
 		defer coll.Close()
 		coll.DropCollection()
 	}
 }
 
-func (p *dockerProvisioner) dryMode(ignoredContainers []container) (*dockerProvisioner, error) {
+func (p *dockerProvisioner) dryMode(ignoredContainers []container.Container) (*dockerProvisioner, error) {
 	var err error
 	overridenProvisioner := &dockerProvisioner{
 		collectionName: "containers_dry_" + randomString(),
@@ -198,7 +197,7 @@ func (p *dockerProvisioner) dryMode(ignoredContainers []container) (*dockerProvi
 	}
 	overridenProvisioner.scheduler = &segregatedScheduler{
 		maxMemoryRatio:      p.scheduler.maxMemoryRatio,
-		totalMemoryMetadata: p.scheduler.totalMemoryMetadata,
+		TotalMemoryMetadata: p.scheduler.TotalMemoryMetadata,
 		provisioner:         overridenProvisioner,
 		ignoredContainers:   containerIds,
 	}
@@ -211,7 +210,7 @@ func (p *dockerProvisioner) dryMode(ignoredContainers []container) (*dockerProvi
 	if err != nil {
 		return nil, err
 	}
-	coll := overridenProvisioner.collection()
+	coll := overridenProvisioner.Collection()
 	defer coll.Close()
 	toInsert := make([]interface{}, len(containersToCopy))
 	for i := range containersToCopy {
@@ -226,7 +225,7 @@ func (p *dockerProvisioner) dryMode(ignoredContainers []container) (*dockerProvi
 	return overridenProvisioner, nil
 }
 
-func (p *dockerProvisioner) getCluster() *cluster.Cluster {
+func (p *dockerProvisioner) Cluster() *cluster.Cluster {
 	if p.cluster == nil {
 		panic("nil cluster")
 	}
@@ -234,7 +233,7 @@ func (p *dockerProvisioner) getCluster() *cluster.Cluster {
 }
 
 func (p *dockerProvisioner) StartupMessage() (string, error) {
-	nodeList, err := p.getCluster().UnfilteredNodes()
+	nodeList, err := p.Cluster().UnfilteredNodes()
 	if err != nil {
 		return "", err
 	}
@@ -246,6 +245,10 @@ func (p *dockerProvisioner) StartupMessage() (string, error) {
 }
 
 func (p *dockerProvisioner) Initialize() error {
+	err := bs.RegisterQueueTask(p)
+	if err != nil {
+		return err
+	}
 	return p.initDockerCluster()
 }
 
@@ -259,8 +262,8 @@ func (p *dockerProvisioner) Provision(app provision.App) error {
 	return r.AddBackend(app.GetName())
 }
 
-func (p *dockerProvisioner) Restart(a provision.App, w io.Writer) error {
-	containers, err := p.listContainersByApp(a.GetName())
+func (p *dockerProvisioner) Restart(a provision.App, process string, w io.Writer) error {
+	containers, err := p.listContainersByProcess(a.GetName(), process)
 	if err != nil {
 		return err
 	}
@@ -272,36 +275,47 @@ func (p *dockerProvisioner) Restart(a provision.App, w io.Writer) error {
 		w = ioutil.Discard
 	}
 	writer := io.MultiWriter(w, &app.LogWriter{App: a})
-	_, err = p.runReplaceUnitsPipeline(writer, a, containers, imageId)
+	toAdd := make(map[string]*containersToAdd, len(containers))
+	for _, c := range containers {
+		if _, ok := toAdd[c.ProcessName]; !ok {
+			toAdd[c.ProcessName] = &containersToAdd{Quantity: 0}
+		}
+		toAdd[c.ProcessName].Quantity++
+		toAdd[c.ProcessName].Status = provision.Status(c.Status)
+	}
+	_, err = p.runReplaceUnitsPipeline(writer, a, toAdd, containers, imageId)
 	return err
 }
 
-func (p *dockerProvisioner) Start(app provision.App) error {
-	containers, err := p.listContainersByApp(app.GetName())
+func (p *dockerProvisioner) Start(app provision.App, process string) error {
+	containers, err := p.listContainersByProcess(app.GetName(), process)
 	if err != nil {
 		return errors.New(fmt.Sprintf("Got error while getting app containers: %s", err))
 	}
-	return runInContainers(containers, func(c *container, _ chan *container) error {
-		err := c.start(p, app, false)
+	return runInContainers(containers, func(c *container.Container, _ chan *container.Container) error {
+		err := c.Start(&container.StartArgs{
+			Provisioner: p,
+			App:         app,
+		})
 		if err != nil {
 			return err
 		}
-		c.setStatus(p, provision.StatusStarting.String())
-		if info, err := c.networkInfo(p); err == nil {
+		c.SetStatus(p, provision.StatusStarting.String(), true)
+		if info, err := c.NetworkInfo(p); err == nil {
 			p.fixContainer(c, info)
 		}
 		return nil
 	}, nil, true)
 }
 
-func (p *dockerProvisioner) Stop(app provision.App) error {
-	containers, err := p.listContainersByApp(app.GetName())
+func (p *dockerProvisioner) Stop(app provision.App, process string) error {
+	containers, err := p.listContainersByProcess(app.GetName(), process)
 	if err != nil {
 		log.Errorf("Got error while getting app containers: %s", err)
 		return nil
 	}
-	return runInContainers(containers, func(c *container, _ chan *container) error {
-		err := c.stop(p)
+	return runInContainers(containers, func(c *container.Container, _ chan *container.Container) error {
+		err := c.Stop(p)
 		if err != nil {
 			log.Errorf("Failed to stop %q: %s", app.GetName(), err)
 		}
@@ -363,8 +377,8 @@ func (p *dockerProvisioner) UploadDeploy(app provision.App, archiveFile io.ReadC
 			Cmd:          []string{"/bin/bash", "-c", "cat > " + filePath},
 		},
 	}
-	cluster := p.getCluster()
-	_, container, err := cluster.CreateContainerSchedulerOpts(options, app.GetName())
+	cluster := p.Cluster()
+	_, container, err := cluster.CreateContainerSchedulerOpts(options, []string{app.GetName(), ""})
 	if err != nil {
 		return "", err
 	}
@@ -419,12 +433,51 @@ func (p *dockerProvisioner) deploy(a provision.App, imageId string, w io.Writer)
 	if err != nil {
 		return err
 	}
+	imageData, err := getImageCustomData(imageId)
+	if err != nil {
+		return err
+	}
 	if len(containers) == 0 {
-		_, err = p.runCreateUnitsPipeline(w, a, 1, imageId)
+		toAdd := make(map[string]*containersToAdd, len(imageData.Processes))
+		for processName := range imageData.Processes {
+			_, ok := toAdd[processName]
+			if !ok {
+				ct := containersToAdd{Quantity: 0}
+				toAdd[processName] = &ct
+			}
+			toAdd[processName].Quantity++
+		}
+		_, err = p.runCreateUnitsPipeline(w, a, toAdd, imageId)
 	} else {
-		_, err = p.runReplaceUnitsPipeline(w, a, containers, imageId)
+		toAdd := getContainersToAdd(imageData, containers)
+		_, err = p.runReplaceUnitsPipeline(w, a, toAdd, containers, imageId)
 	}
 	return err
+}
+
+func getContainersToAdd(data ImageMetadata, oldContainers []container.Container) map[string]*containersToAdd {
+	processMap := make(map[string]*containersToAdd, len(data.Processes))
+	for name := range data.Processes {
+		processMap[name] = &containersToAdd{}
+	}
+	minCount := 0
+	for _, container := range oldContainers {
+		if container.ProcessName == "" {
+			minCount++
+		}
+		if _, ok := processMap[container.ProcessName]; ok {
+			processMap[container.ProcessName].Quantity++
+		}
+	}
+	if minCount == 0 {
+		minCount = 1
+	}
+	for name, cont := range processMap {
+		if cont.Quantity == 0 {
+			processMap[name].Quantity = minCount
+		}
+	}
+	return processMap
 }
 
 func (p *dockerProvisioner) Destroy(app provision.App) error {
@@ -433,23 +486,27 @@ func (p *dockerProvisioner) Destroy(app provision.App) error {
 		log.Errorf("Failed to list app containers: %s", err.Error())
 		return err
 	}
-	runInContainers(containers, func(c *container, _ chan *container) error {
-		unit := c.asUnit(app)
-		err := app.UnbindUnit(&unit)
-		if err != nil {
-			log.Errorf("Unable to unbind unit %q: %s", c.ID, err)
-		}
-		err = p.removeContainer(c, app)
-		if err != nil {
-			log.Errorf("Unable to destroy container %s: %s", c.ID, err.Error())
-		}
-		return nil
-	}, nil, true)
+	args := changeUnitsPipelineArgs{
+		app:         app,
+		toRemove:    containers,
+		writer:      ioutil.Discard,
+		provisioner: p,
+		appDestroy:  true,
+	}
+	pipeline := action.NewPipeline(
+		&removeOldRoutes,
+		&provisionRemoveOldUnits,
+		&provisionUnbindOldUnits,
+	)
+	err = pipeline.Execute(args)
+	if err != nil {
+		return err
+	}
 	images, err := listAppImages(app.GetName())
 	if err != nil {
 		log.Errorf("Failed to get image ids for app %s: %s", app.GetName(), err.Error())
 	}
-	cluster := p.getCluster()
+	cluster := p.Cluster()
 	for _, imageId := range images {
 		err := cluster.RemoveImage(imageId)
 		if err != nil {
@@ -491,26 +548,34 @@ func (*dockerProvisioner) Addr(app provision.App) (string, error) {
 	return addr, nil
 }
 
-func (p *dockerProvisioner) runRestartAfterHooks(cont *container, w io.Writer) error {
-	yamlData, err := getImageTsuruYamlDataWithFallback(cont.Image, cont.AppName)
+func (p *dockerProvisioner) runRestartAfterHooks(cont *container.Container, w io.Writer) error {
+	yamlData, err := getImageTsuruYamlData(cont.Image)
 	if err != nil {
 		return err
 	}
 	cmds := yamlData.Hooks.Restart.After
 	for _, cmd := range cmds {
-		err := cont.exec(p, w, w, cmd)
+		err := cont.Exec(p, w, w, cmd)
 		if err != nil {
-			return fmt.Errorf("couldn't execute restart:after hook %q(%s): %s", cmd, cont.shortID(), err.Error())
+			return fmt.Errorf("couldn't execute restart:after hook %q(%s): %s", cmd, cont.ShortID(), err.Error())
 		}
 	}
 	return nil
 }
 
-func addContainersWithHost(args *changeUnitsPipelineArgs) ([]container, error) {
+func addContainersWithHost(args *changeUnitsPipelineArgs) ([]container.Container, error) {
 	a := args.app
 	w := args.writer
-	units := args.unitsToAdd
+	var units int
+	processMsg := make([]string, 0, len(args.toAdd))
 	imageId := args.imageId
+	for processName, v := range args.toAdd {
+		units += v.Quantity
+		if processName == "" {
+			_, processName, _ = processCmdForImage(processName, imageId)
+		}
+		processMsg = append(processMsg, fmt.Sprintf("[%s: %d]", processName, v.Quantity))
+	}
 	var destinationHost []string
 	if args.toHost != "" {
 		destinationHost = []string{args.toHost}
@@ -518,61 +583,52 @@ func addContainersWithHost(args *changeUnitsPipelineArgs) ([]container, error) {
 	if w == nil {
 		w = ioutil.Discard
 	}
-	wg := sync.WaitGroup{}
-	createdContainers := make(chan *container, units)
-	errors := make(chan error, units)
-	var plural string
-	if units > 1 {
-		plural = "s"
-	}
-	fmt.Fprintf(w, "\n---- Starting %d new unit%s ----\n", units, plural)
-	workers, _ := config.GetInt("docker:max-workers")
-	if workers == 0 {
-		workers = units
-	}
-	step := units/workers + 1
-	for i := 0; i < units; i += step {
-		wg.Add(1)
-		last := i + step
-		if last > units {
-			last = units
+	fmt.Fprintf(w, "\n---- Starting %d new %s %s ----\n", units, pluralize("unit", units), strings.Join(processMsg, " "))
+	oldContainers := make([]container.Container, 0, units)
+	for processName, cont := range args.toAdd {
+		for i := 0; i < cont.Quantity; i++ {
+			oldContainers = append(oldContainers, container.Container{
+				ProcessName: processName,
+				Status:      cont.Status.String(),
+			})
 		}
-		go func(amount int) {
-			defer wg.Done()
-			for i := 0; i < amount; i++ {
-				c, err := args.provisioner.start(a, imageId, w, destinationHost...)
-				if err != nil {
-					errors <- err
-					return
-				}
-				createdContainers <- c
-				fmt.Fprintf(w, " ---> Started unit %s...\n", c.shortID())
-			}
-		}(last - i)
 	}
-	wg.Wait()
-	close(errors)
-	close(createdContainers)
-	if err := <-errors; err != nil {
-		for c := range createdContainers {
-			log.Errorf("Removing container %q due failed add units: %s", c.ID, err)
-			errRem := args.provisioner.removeContainer(c, a)
-			if errRem != nil {
-				log.Errorf("Unable to destroy container %q: %s - %s", c.ID, err, errRem)
-			}
+	rollbackCallback := func(c *container.Container) {
+		log.Errorf("Removing container %q due failed add units.", c.ID)
+		errRem := c.Remove(args.provisioner)
+		if errRem != nil {
+			log.Errorf("Unable to destroy container %q: %s", c.ID, errRem)
 		}
+	}
+	var (
+		createdContainers []*container.Container
+		m                 sync.Mutex
+	)
+	err := runInContainers(oldContainers, func(c *container.Container, toRollback chan *container.Container) error {
+		c, err := args.provisioner.start(c, a, imageId, w, destinationHost...)
+		if err != nil {
+			return err
+		}
+		toRollback <- c
+		m.Lock()
+		createdContainers = append(createdContainers, c)
+		m.Unlock()
+		fmt.Fprintf(w, " ---> Started unit %s [%s]\n", c.ShortID(), c.ProcessName)
+		return nil
+	}, rollbackCallback, true)
+	if err != nil {
 		return nil, err
 	}
-	result := make([]container, units)
+	result := make([]container.Container, len(createdContainers))
 	i := 0
-	for c := range createdContainers {
+	for _, c := range createdContainers {
 		result[i] = *c
 		i++
 	}
 	return result, nil
 }
 
-func (p *dockerProvisioner) AddUnits(a provision.App, units uint, w io.Writer) ([]provision.Unit, error) {
+func (p *dockerProvisioner) AddUnits(a provision.App, units uint, process string, w io.Writer) ([]provision.Unit, error) {
 	if a.GetDeploys() == 0 {
 		return nil, errors.New("New units can only be added after the first deployment")
 	}
@@ -587,93 +643,92 @@ func (p *dockerProvisioner) AddUnits(a provision.App, units uint, w io.Writer) (
 	if err != nil {
 		return nil, err
 	}
-	conts, err := p.runCreateUnitsPipeline(writer, a, int(units), imageId)
+	conts, err := p.runCreateUnitsPipeline(writer, a, map[string]*containersToAdd{process: {Quantity: int(units)}}, imageId)
 	if err != nil {
 		return nil, err
 	}
 	result := make([]provision.Unit, len(conts))
 	for i, c := range conts {
-		result[i] = c.asUnit(a)
+		result[i] = c.AsUnit(a)
 	}
 	return result, nil
 }
 
-func (p *dockerProvisioner) RemoveUnits(a provision.App, units uint) error {
+func (p *dockerProvisioner) RemoveUnits(a provision.App, units uint, processName string, w io.Writer) error {
 	if a == nil {
 		return errors.New("remove units: app should not be nil")
 	}
-	if units < 1 {
-		return errors.New("remove units: units must be at least 1")
+	if units == 0 {
+		return errors.New("cannot remove zero units")
 	}
-	countUnits, err := p.getContainerCountForAppName(a.GetName())
+	var err error
+	if w == nil {
+		w = ioutil.Discard
+	}
+	imgId, err := appCurrentImageName(a.GetName())
 	if err != nil {
 		return err
 	}
-	if int(units) > countUnits {
-		return errors.New(fmt.Sprintf("remove units: cannot remove %d units. App %s has just %d units.", units, a.GetName(), countUnits))
+	_, processName, err = processCmdForImage(processName, imgId)
+	if err != nil {
+		return err
 	}
+	containers, err := p.listContainersByProcess(a.GetName(), processName)
+	if err != nil {
+		return err
+	}
+	if len(containers) < int(units) {
+		return fmt.Errorf("cannot remove %d units from process %q, only %d available", units, processName, len(containers))
+	}
+	fmt.Fprintf(w, "\n---- Removing %d %s ----\n", units, pluralize("unit", int(units)))
+	p, err = p.cloneProvisioner(nil)
+	if err != nil {
+		return err
+	}
+	toRemove := make([]container.Container, 0, units)
 	for i := 0; i < int(units); i++ {
-		containerID, err := p.scheduler.GetRemovableContainer(a.GetName(), p.cluster)
+		containerID, err := p.scheduler.GetRemovableContainer(a.GetName(), processName)
 		if err != nil {
 			return err
 		}
-		c, err := p.getContainer(containerID)
+		cont, err := p.GetContainer(containerID)
 		if err != nil {
 			return err
 		}
-		unit := c.asUnit(a)
-		err = a.UnbindUnit(&unit)
-		if err != nil {
-			log.Errorf("Failed to unbind unit %q: %s", c.ID, err)
-		}
-		err = p.removeContainer(c, a)
-		if err != nil {
-			log.Errorf("Failed to remove container %q: %s", c.ID, err)
-		}
+		p.scheduler.ignoredContainers = append(p.scheduler.ignoredContainers, cont.ID)
+		toRemove = append(toRemove, *cont)
+	}
+	args := changeUnitsPipelineArgs{
+		app:         a,
+		toRemove:    toRemove,
+		writer:      w,
+		provisioner: p,
+	}
+	pipeline := action.NewPipeline(
+		&removeOldRoutes,
+		&provisionRemoveOldUnits,
+		&provisionUnbindOldUnits,
+	)
+	err = pipeline.Execute(args)
+	if err != nil {
+		return fmt.Errorf("error removing routes, units weren't removed: %s", err)
 	}
 	return nil
 }
 
-func (p *dockerProvisioner) RemoveUnit(unit provision.Unit) error {
-	container, err := p.getContainer(unit.Name)
-	if err != nil {
-		return err
-	}
-	a, err := container.getApp()
-	if err != nil {
-		return err
-	}
-	err = a.UnbindUnit(&unit)
-	if err != nil {
-		log.Errorf("Failed to unbind unit %q: %s", container.ID, err)
-	}
-	return p.removeContainer(container, a)
-}
-
-func (p *dockerProvisioner) removeContainer(c *container, a provision.App) error {
-	if r, err := getRouterForApp(a); err == nil {
-		if err := r.RemoveRoute(c.AppName, c.getAddress()); err != nil {
-			log.Errorf("Failed to remove route: %s", err)
-		}
-	} else {
-		log.Errorf("Failed to obtain router: %s", err)
-	}
-	err := c.remove(p)
-	if err != nil {
-		log.Errorf("error on remove container %s - %s", c.ID, err)
-	}
-	return err
-}
-
 func (p *dockerProvisioner) SetUnitStatus(unit provision.Unit, status provision.Status) error {
-	container, err := p.getContainer(unit.Name)
+	container, err := p.GetContainer(unit.Name)
 	if err != nil {
 		return err
 	}
-	if container.AppName != unit.AppName {
+	if unit.AppName != "" && container.AppName != unit.AppName {
 		return errors.New("wrong app name")
 	}
-	return container.setStatus(p, status.String())
+	err = container.SetStatus(p, status.String(), true)
+	if err != nil {
+		return err
+	}
+	return p.checkContainer(container)
 }
 
 func (p *dockerProvisioner) ExecuteCommandOnce(stdout, stderr io.Writer, app provision.App, cmd string, args ...string) error {
@@ -685,7 +740,7 @@ func (p *dockerProvisioner) ExecuteCommandOnce(stdout, stderr io.Writer, app pro
 		return provision.ErrEmptyApp
 	}
 	container := containers[0]
-	return container.exec(p, stdout, stderr, cmd, args...)
+	return container.Exec(p, stdout, stderr, cmd, args...)
 }
 
 func (p *dockerProvisioner) ExecuteCommand(stdout, stderr io.Writer, app provision.App, cmd string, args ...string) error {
@@ -697,7 +752,7 @@ func (p *dockerProvisioner) ExecuteCommand(stdout, stderr io.Writer, app provisi
 		return provision.ErrEmptyApp
 	}
 	for _, c := range containers {
-		err = c.exec(p, stdout, stderr, cmd, args...)
+		err = c.Exec(p, stdout, stderr, cmd, args...)
 		if err != nil {
 			return err
 		}
@@ -730,14 +785,20 @@ func (p *dockerProvisioner) AdminCommands() []cmd.Command {
 		&removeNodeFromSchedulerCmd{},
 		&listNodesInTheSchedulerCmd{},
 		fixContainersCmd{},
-		&listHealingHistoryCmd{},
+		&healer.ListHealingHistoryCmd{},
+		&autoScaleRunCmd{},
 		&listAutoScaleHistoryCmd{},
+		&autoScaleInfoCmd{},
+		&autoScaleSetRuleCmd{},
+		&autoScaleDeleteRuleCmd{},
 		&updateNodeToSchedulerCmd{},
-		&listAutoScaleRunCmd{},
+		&bs.EnvSetCmd{},
+		&bs.InfoCmd{},
+		&bs.UpgradeCmd{},
 	}
 }
 
-func (p *dockerProvisioner) collection() *storage.Collection {
+func (p *dockerProvisioner) Collection() *storage.Collection {
 	conn, err := db.Conn()
 	if err != nil {
 		log.Errorf("Failed to connect to the database: %s", err)
@@ -754,7 +815,7 @@ func (p *dockerProvisioner) PlatformAdd(name string, args map[string]string, w i
 		return errors.New("dockerfile parameter should be an url.")
 	}
 	imageName := platformImageName(name)
-	cluster := p.getCluster()
+	cluster := p.Cluster()
 	buildOptions := docker.BuildImageOptions{
 		Name:           imageName,
 		NoCache:        true,
@@ -779,7 +840,7 @@ func (p *dockerProvisioner) PlatformAdd(name string, args map[string]string, w i
 		imageName = parts[0]
 		tag = "latest"
 	}
-	return p.pushImage(imageName, tag)
+	return p.PushImage(imageName, tag)
 }
 
 func (p *dockerProvisioner) PlatformUpdate(name string, args map[string]string, w io.Writer) error {
@@ -787,7 +848,7 @@ func (p *dockerProvisioner) PlatformUpdate(name string, args map[string]string, 
 }
 
 func (p *dockerProvisioner) PlatformRemove(name string) error {
-	err := p.getCluster().RemoveImage(platformImageName(name))
+	err := p.Cluster().RemoveImage(platformImageName(name))
 	if err != nil && err == docker.ErrNoSuchImage {
 		log.Errorf("error on remove image %s from docker.", name)
 		return nil
@@ -795,21 +856,42 @@ func (p *dockerProvisioner) PlatformRemove(name string) error {
 	return err
 }
 
-func (p *dockerProvisioner) Units(app provision.App) []provision.Unit {
+func (p *dockerProvisioner) Units(app provision.App) ([]provision.Unit, error) {
 	containers, err := p.listContainersByApp(app.GetName())
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	units := []provision.Unit{}
+	units := make([]provision.Unit, len(containers))
+	for i, container := range containers {
+		units[i] = container.AsUnit(app)
+	}
+	return units, nil
+}
+
+func (p *dockerProvisioner) RoutableUnits(app provision.App) ([]provision.Unit, error) {
+	imageId, err := appCurrentImageName(app.GetName())
+	if err != nil {
+		return nil, err
+	}
+	webProcessName, err := getImageWebProcessName(imageId)
+	if err != nil {
+		return nil, err
+	}
+	containers, err := p.listContainersByApp(app.GetName())
+	if err != nil {
+		return nil, err
+	}
+	units := make([]provision.Unit, 0, len(containers))
 	for _, container := range containers {
-		unit := unitFromContainer(container)
-		units = append(units, unit)
+		if container.ProcessName == webProcessName {
+			units = append(units, container.AsUnit(app))
+		}
 	}
-	return units
+	return units, nil
 }
 
 func (p *dockerProvisioner) RegisterUnit(unit provision.Unit, customData map[string]interface{}) error {
-	container, err := p.getContainer(unit.Name)
+	container, err := p.GetContainer(unit.Name)
 	if err != nil {
 		return err
 	}
@@ -819,7 +901,7 @@ func (p *dockerProvisioner) RegisterUnit(unit provision.Unit, customData map[str
 		}
 		return nil
 	}
-	err = container.setStatus(p, provision.StatusStarted.String())
+	err = container.SetStatus(p, provision.StatusStarted.String(), true)
 	if err != nil {
 		return err
 	}
@@ -828,18 +910,18 @@ func (p *dockerProvisioner) RegisterUnit(unit provision.Unit, customData map[str
 
 func (p *dockerProvisioner) Shell(opts provision.ShellOptions) error {
 	var (
-		c   *container
+		c   *container.Container
 		err error
 	)
 	if opts.Unit != "" {
-		c, err = p.getContainer(opts.Unit)
+		c, err = p.GetContainer(opts.Unit)
 	} else {
 		c, err = p.getOneContainerByAppName(opts.App.GetName())
 	}
 	if err != nil {
 		return err
 	}
-	return c.shell(p, opts.Conn, opts.Conn, opts.Conn, pty{width: opts.Width, height: opts.Height, term: opts.Term})
+	return c.Shell(p, opts.Conn, opts.Conn, opts.Conn, container.Pty{Width: opts.Width, Height: opts.Height, Term: opts.Term})
 }
 
 func (p *dockerProvisioner) ValidAppImages(appName string) ([]string, error) {
@@ -861,19 +943,19 @@ func (p *dockerProvisioner) Nodes(app provision.App) ([]cluster.Node, error) {
 		return nil, err
 	}
 	if len(pools) == 0 {
-		query := bson.M{"$or": []bson.M{{"teams": bson.M{"$exists": false}}, {"teams": bson.M{"$size": 0}}}}
+		query := bson.M{"default": true}
 		pools, err = provision.ListPools(query)
 		if err != nil {
 			return nil, err
 		}
 	}
 	if len(pools) == 0 {
-		return nil, errNoFallback
+		return nil, errNoDefaultPool
 	}
 	for _, pool := range pools {
-		nodes, err := p.getCluster().NodesForMetadata(map[string]string{"pool": pool.Name})
+		nodes, err := p.Cluster().NodesForMetadata(map[string]string{"pool": pool.Name})
 		if err != nil {
-			return nil, errNoFallback
+			return nil, errNoDefaultPool
 		}
 		if len(nodes) > 0 {
 			return nodes, nil
@@ -885,4 +967,30 @@ func (p *dockerProvisioner) Nodes(app provision.App) ([]cluster.Node, error) {
 	}
 	poolsStr := strings.Join(nameList, ", pool=")
 	return nil, fmt.Errorf("No nodes found with one of the following metadata: pool=%s", poolsStr)
+}
+
+func (p *dockerProvisioner) MetricEnvs(app provision.App) map[string]string {
+	envMap := map[string]string{}
+	bsConf, err := bs.LoadConfig()
+	if err != nil {
+		return envMap
+	}
+	envs, err := bsConf.EnvListForEndpoint("", app.GetPool())
+	if err != nil {
+		return envMap
+	}
+	for _, env := range envs {
+		if strings.HasPrefix(env, "METRICS_") {
+			slice := strings.SplitN(env, "=", 2)
+			envMap[slice[0]] = slice[1]
+		}
+	}
+	return envMap
+}
+
+func pluralize(str string, sz int) string {
+	if sz == 0 || sz > 1 {
+		str = str + "s"
+	}
+	return str
 }

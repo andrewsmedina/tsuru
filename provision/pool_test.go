@@ -7,6 +7,7 @@ package provision
 import (
 	"github.com/tsuru/tsuru/db"
 	"gopkg.in/check.v1"
+	"gopkg.in/mgo.v2/bson"
 )
 
 type S struct {
@@ -24,14 +25,122 @@ func (s *S) SetUpSuite(c *check.C) {
 func (s *S) TestAddPool(c *check.C) {
 	coll := s.storage.Collection(poolCollection)
 	defer coll.RemoveId("pool1")
-	err := AddPool("pool1")
+	opts := AddPoolOptions{
+		Name:    "pool1",
+		Public:  false,
+		Default: false,
+	}
+	err := AddPool(opts)
 	c.Assert(err, check.IsNil)
 }
 
+func (s *S) TestAddNonPublicPool(c *check.C) {
+	coll := s.storage.Collection(poolCollection)
+	defer coll.RemoveId("pool1")
+	opts := AddPoolOptions{
+		Name:    "pool1",
+		Public:  false,
+		Default: false,
+	}
+	err := AddPool(opts)
+	c.Assert(err, check.IsNil)
+	var p Pool
+	err = coll.Find(bson.M{"_id": "pool1"}).One(&p)
+	c.Assert(err, check.IsNil)
+	c.Assert(p.Public, check.Equals, false)
+}
+
+func (s *S) TestAddPublicPool(c *check.C) {
+	coll := s.storage.Collection(poolCollection)
+	defer coll.RemoveId("pool1")
+	opts := AddPoolOptions{
+		Name:    "pool1",
+		Public:  true,
+		Default: false,
+	}
+	err := AddPool(opts)
+	c.Assert(err, check.IsNil)
+	var p Pool
+	err = coll.Find(bson.M{"_id": "pool1"}).One(&p)
+	c.Assert(err, check.IsNil)
+	c.Assert(p.Public, check.Equals, true)
+}
+
 func (s *S) TestAddPoolWithoutNameShouldBreak(c *check.C) {
-	err := AddPool("")
+	opts := AddPoolOptions{
+		Name:    "",
+		Public:  false,
+		Default: false,
+	}
+	err := AddPool(opts)
 	c.Assert(err, check.NotNil)
 	c.Assert(err.Error(), check.Equals, "Pool name is required.")
+}
+
+func (s *S) TestAddDefaultPool(c *check.C) {
+	opts := AddPoolOptions{
+		Name:    "pool1",
+		Public:  false,
+		Default: true,
+	}
+	err := AddPool(opts)
+	defer RemovePool("pool1")
+	c.Assert(err, check.IsNil)
+}
+
+func (s *S) TestDefaultPoolCantHaveTeam(c *check.C) {
+	coll := s.storage.Collection(poolCollection)
+	pool := Pool{Name: "nonteams", Public: false, Default: true}
+	err := coll.Insert(pool)
+	c.Assert(err, check.IsNil)
+	defer coll.RemoveId(pool.Name)
+	err = AddTeamsToPool(pool.Name, []string{"ateam"})
+	c.Assert(err, check.NotNil)
+	c.Assert(err, check.Equals, ErrPublicDefaultPollCantHaveTeams)
+}
+
+func (s *S) TestDefaultPoolShouldBeUnique(c *check.C) {
+	coll := s.storage.Collection(poolCollection)
+	pool := Pool{Name: "nonteams", Public: false, Default: true}
+	err := coll.Insert(pool)
+	c.Assert(err, check.IsNil)
+	defer coll.RemoveId(pool.Name)
+	opts := AddPoolOptions{
+		Name:    "pool1",
+		Public:  false,
+		Default: true,
+	}
+	err = AddPool(opts)
+	defer RemovePool("pool1")
+	c.Assert(err, check.NotNil)
+}
+
+func (s *S) TestForceAddDefaultPool(c *check.C) {
+	coll := s.storage.Collection(poolCollection)
+	opts := AddPoolOptions{
+		Name:    "pool1",
+		Public:  false,
+		Default: true,
+	}
+	err := AddPool(opts)
+	defer RemovePool("pool1")
+	c.Assert(err, check.IsNil)
+	opts = AddPoolOptions{
+		Name:    "pool2",
+		Public:  false,
+		Default: true,
+		Force:   true,
+	}
+	err = AddPool(opts)
+	defer RemovePool("pool2")
+	c.Assert(err, check.IsNil)
+	var p Pool
+	err = coll.Find(bson.M{"_id": "pool1"}).One(&p)
+	c.Assert(err, check.IsNil)
+	c.Assert(p.Default, check.Equals, false)
+	err = coll.Find(bson.M{"_id": "pool2"}).One(&p)
+	c.Assert(err, check.IsNil)
+	c.Assert(p.Default, check.Equals, true)
 }
 
 func (s *S) TestRemovePool(c *check.C) {
@@ -88,6 +197,17 @@ func (s *S) TestAddTeamToPollShouldNotAcceptDuplicatedTeam(c *check.C) {
 	c.Assert(p.Teams, check.DeepEquals, []string{"test", "ateam"})
 }
 
+func (s *S) TestAddTeamsToAPublicPool(c *check.C) {
+	coll := s.storage.Collection(poolCollection)
+	pool := Pool{Name: "nonteams", Public: true}
+	err := coll.Insert(pool)
+	c.Assert(err, check.IsNil)
+	defer coll.RemoveId(pool.Name)
+	err = AddTeamsToPool(pool.Name, []string{"ateam"})
+	c.Assert(err, check.NotNil)
+	c.Assert(err, check.Equals, ErrPublicDefaultPollCantHaveTeams)
+}
+
 func (s *S) TestRemoveTeamsFromPool(c *check.C) {
 	coll := s.storage.Collection(poolCollection)
 	pool := Pool{Name: "pool1", Teams: []string{"test", "ateam"}}
@@ -106,4 +226,113 @@ func (s *S) TestGetPoolsNames(c *check.C) {
 	pool := Pool{Name: "pool1", Teams: []string{"test", "ateam"}}
 	pools := GetPoolsNames([]Pool{pool})
 	c.Assert(pools[0], check.Equals, "pool1")
+}
+
+func (s *S) TestPoolUpdate(c *check.C) {
+	coll := s.storage.Collection(poolCollection)
+	pool := Pool{Name: "pool1", Public: false}
+	err := coll.Insert(pool)
+	c.Assert(err, check.IsNil)
+	defer coll.RemoveId(pool.Name)
+	err = PoolUpdate("pool1", bson.M{"public": true}, false)
+	c.Assert(err, check.IsNil)
+	var p Pool
+	err = coll.Find(bson.M{"_id": pool.Name}).One(&p)
+	c.Assert(err, check.IsNil)
+	c.Assert(p.Public, check.Equals, true)
+}
+
+func (s *S) TestPoolUpdateToDefault(c *check.C) {
+	coll := s.storage.Collection(poolCollection)
+	pool := Pool{Name: "pool1", Public: false, Default: false}
+	err := coll.Insert(pool)
+	c.Assert(err, check.IsNil)
+	defer coll.RemoveId(pool.Name)
+	err = PoolUpdate("pool1", bson.M{"public": true, "default": true}, false)
+	c.Assert(err, check.IsNil)
+	var p Pool
+	err = coll.Find(bson.M{"_id": pool.Name}).One(&p)
+	c.Assert(err, check.IsNil)
+	c.Assert(p.Default, check.Equals, true)
+}
+
+func (s *S) TestPoolUpdateForceToDefault(c *check.C) {
+	coll := s.storage.Collection(poolCollection)
+	pool := Pool{Name: "pool1", Public: false, Default: true}
+	err := coll.Insert(pool)
+	c.Assert(err, check.IsNil)
+	defer coll.RemoveId(pool.Name)
+	pool = Pool{Name: "pool2", Public: false, Default: false}
+	err = coll.Insert(pool)
+	c.Assert(err, check.IsNil)
+	defer coll.RemoveId(pool.Name)
+	err = PoolUpdate("pool2", bson.M{"public": true, "default": true}, true)
+	c.Assert(err, check.IsNil)
+	var p Pool
+	err = coll.Find(bson.M{"_id": "pool2"}).One(&p)
+	c.Assert(err, check.IsNil)
+	c.Assert(p.Default, check.Equals, true)
+}
+
+func (s *S) TestPoolUpdateDefaultAttrFailIfDefaultPoolAlreadyExists(c *check.C) {
+	coll := s.storage.Collection(poolCollection)
+	pool := Pool{Name: "pool1", Public: false, Default: true}
+	err := coll.Insert(pool)
+	c.Assert(err, check.IsNil)
+	defer coll.RemoveId(pool.Name)
+	pool = Pool{Name: "pool2", Public: false, Default: false}
+	err = coll.Insert(pool)
+	c.Assert(err, check.IsNil)
+	defer coll.RemoveId(pool.Name)
+	err = PoolUpdate("pool2", bson.M{"public": true, "default": true}, false)
+	c.Assert(err, check.NotNil)
+	c.Assert(err, check.Equals, ErrDefaultPoolAlreadyExists)
+}
+
+func (s *S) TestPoolUpdateDontHaveSideEffects(c *check.C) {
+	coll := s.storage.Collection(poolCollection)
+	pool := Pool{Name: "pool1", Public: false, Default: true}
+	err := coll.Insert(pool)
+	c.Assert(err, check.IsNil)
+	defer coll.RemoveId(pool.Name)
+	err = PoolUpdate("pool1", bson.M{"public": true}, false)
+	c.Assert(err, check.IsNil)
+	var p Pool
+	err = coll.Find(bson.M{"_id": pool.Name}).One(&p)
+	c.Assert(err, check.IsNil)
+	c.Assert(p.Public, check.Equals, true)
+	c.Assert(p.Default, check.Equals, true)
+}
+
+func (s *S) TestListPoolAll(c *check.C) {
+	coll := s.storage.Collection(poolCollection)
+	pool := Pool{Name: "pool1", Public: false, Default: true}
+	err := coll.Insert(pool)
+	c.Assert(err, check.IsNil)
+	defer coll.RemoveId(pool.Name)
+	pools, err := ListPools(nil)
+	c.Assert(err, check.IsNil)
+	c.Assert(len(pools), check.Equals, 1)
+}
+
+func (s *S) TestListPoolByQuery(c *check.C) {
+	coll := s.storage.Collection(poolCollection)
+	pool := Pool{Name: "pool1", Public: false, Default: true}
+	err := coll.Insert(pool)
+	c.Assert(err, check.IsNil)
+	pool2 := Pool{Name: "pool2", Public: true, Default: true}
+	err = coll.Insert(pool2)
+	c.Assert(err, check.IsNil)
+	defer coll.RemoveId(pool.Name)
+	defer coll.RemoveId(pool2.Name)
+	pools, err := ListPools(bson.M{"public": true})
+	c.Assert(err, check.IsNil)
+	c.Assert(len(pools), check.Equals, 1)
+	c.Assert(pools[0].Public, check.Equals, true)
+}
+
+func (s *S) TestListPoolEmpty(c *check.C) {
+	pools, err := ListPools(nil)
+	c.Assert(err, check.IsNil)
+	c.Assert(len(pools), check.Equals, 0)
 }

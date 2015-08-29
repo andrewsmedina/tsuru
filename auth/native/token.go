@@ -1,4 +1,4 @@
-// Copyright 2014 tsuru authors. All rights reserved.
+// Copyright 2015 tsuru authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -202,7 +202,7 @@ func getToken(header string) (*Token, error) {
 		}
 		return nil, err
 	}
-	if t.Creation.Add(t.Expires).Sub(time.Now()) < 1 {
+	if t.Expires > 0 && t.Creation.Add(t.Expires).Sub(time.Now()) < 1 {
 		return nil, auth.ErrInvalidToken
 	}
 	return &t, nil
@@ -236,7 +236,7 @@ func createApplicationToken(appName string) (*Token, error) {
 	t := Token{
 		Token:    token(appName, crypto.SHA1),
 		Creation: time.Now(),
-		Expires:  365 * 24 * time.Hour,
+		Expires:  0,
 		AppName:  appName,
 	}
 	err = conn.Tokens().Insert(t)

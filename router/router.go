@@ -9,18 +9,30 @@ package router
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
+	"strings"
 
 	"github.com/tsuru/config"
 	"github.com/tsuru/tsuru/db"
 	"github.com/tsuru/tsuru/db/storage"
 	"github.com/tsuru/tsuru/log"
+	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 )
 
 type routerFactory func(string) (Router, error)
 
-var ErrRouteNotFound = errors.New("Route not found")
+var (
+	ErrBackendExists   = errors.New("Backend already exists")
+	ErrBackendNotFound = errors.New("Backend not found")
+	ErrBackendSwapped  = errors.New("Backend is swapped cannot remove")
+	ErrRouteExists     = errors.New("Route already exists")
+	ErrRouteNotFound   = errors.New("Route not found")
+	ErrCNameExists     = errors.New("CName already exists")
+	ErrCNameNotFound   = errors.New("CName not found")
+	ErrCNameNotAllowed = errors.New("CName as router subdomain not allowed")
+)
 
 var routers = make(map[string]routerFactory)
 
@@ -58,8 +70,8 @@ func Get(name string) (Router, error) {
 type Router interface {
 	AddBackend(name string) error
 	RemoveBackend(name string) error
-	AddRoute(name, address string) error
-	RemoveRoute(name, address string) error
+	AddRoute(name string, address *url.URL) error
+	RemoveRoute(name string, address *url.URL) error
 	SetCName(cname, name string) error
 	UnsetCName(cname, name string) error
 	Addr(name string) (string, error)
@@ -68,7 +80,7 @@ type Router interface {
 	Swap(string, string) error
 
 	// Routes returns a list of routes of a backend.
-	Routes(name string) ([]string, error)
+	Routes(name string) ([]*url.URL, error)
 }
 
 type MessageRouter interface {
@@ -77,6 +89,15 @@ type MessageRouter interface {
 
 type HealthChecker interface {
 	HealthCheck() error
+}
+
+type RouterError struct {
+	Op  string
+	Err error
+}
+
+func (e *RouterError) Error() string {
+	return fmt.Sprintf("[router %s] %s", e.Op, e.Err)
 }
 
 func collection() (*storage.Collection, error) {
@@ -122,6 +143,9 @@ func retrieveRouterData(appName string) (map[string]string, error) {
 func Retrieve(appName string) (string, error) {
 	data, err := retrieveRouterData(appName)
 	if err != nil {
+		if err == mgo.ErrNotFound {
+			return "", ErrBackendNotFound
+		}
 		return "", err
 	}
 	return data["router"], nil
@@ -236,4 +260,10 @@ func List() ([]PlanRouter, error) {
 		routersList = append(routersList, PlanRouter{Name: value, Type: routerType})
 	}
 	return routersList, nil
+}
+
+// validCName returns true if the cname is not a subdomain of
+// the router current domain, false otherwise.
+func ValidCName(cname, domain string) bool {
+	return !strings.HasSuffix(cname, domain)
 }

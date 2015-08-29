@@ -86,12 +86,19 @@ func (s *S) TestFakeFileFd(c *check.C) {
 	c.Assert(fd, check.Equals, f.f.Fd())
 }
 
+func (s *S) TestFakeFileName(c *check.C) {
+	var f FakeFile
+	f.name = "/home/user/.bash_profile"
+	defer f.Close()
+	c.Assert(f.Name(), check.Equals, f.name)
+}
+
 func (s *S) TestFakeFileStat(c *check.C) {
-	var empty os.FileInfo
-	f := &FakeFile{content: "doesn't matter"}
+	expected := &fileInfo{name: "something", size: 14}
+	f := &FakeFile{name: "something", content: "doesn't matter"}
 	fi, err := f.Stat()
 	c.Assert(err, check.IsNil)
-	c.Assert(fi, check.DeepEquals, empty)
+	c.Assert(fi, check.DeepEquals, expected)
 }
 
 func (s *S) TestFakeFileWrite(c *check.C) {
@@ -100,7 +107,7 @@ func (s *S) TestFakeFileWrite(c *check.C) {
 	n, err := f.Write([]byte("break"))
 	c.Assert(err, check.IsNil)
 	c.Assert(n, check.Equals, len("break"))
-	c.Assert(f.content, check.Equals, "break")
+	c.Assert(f.content, check.Equals, "breakian")
 }
 
 func (s *S) TestFakeFileWriteFromPosition(c *check.C) {
@@ -121,7 +128,7 @@ func (s *S) TestFakeFileWriteString(c *check.C) {
 	ret, err := f.WriteString("break")
 	c.Assert(err, check.IsNil)
 	c.Assert(ret, check.Equals, len("break"))
-	c.Assert(f.content, check.Equals, "break")
+	c.Assert(f.content, check.Equals, "breakian")
 	f.current = int64(ret)
 	ret, err = f.WriteString("break")
 	c.Assert(err, check.IsNil)
@@ -356,9 +363,17 @@ func (s *S) TestRecordingFsCold(c *check.C) {
 }
 
 func (s *S) TestRecordingFsStat(c *check.C) {
-	fs := RecordingFs{}
+	info := &fileInfo{name: "/my/file", size: 9}
+	fs := RecordingFs{FileContent: "something"}
 	fi, err := fs.Stat("/my/file")
 	c.Assert(err, check.IsNil)
+	c.Assert(fi, check.DeepEquals, info)
+}
+
+func (s *S) TestRecordingFsStatNotFound(c *check.C) {
+	fs := RecordingFs{}
+	fi, err := fs.Stat("/my/file")
+	c.Assert(os.IsNotExist(err), check.Equals, true)
 	c.Assert(fi, check.IsNil)
 	c.Assert(fs.HasAction("stat /my/file"), check.Equals, true)
 }
